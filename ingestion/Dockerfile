@@ -10,19 +10,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install psycopg2 for Celery sync tasks
 RUN pip install psycopg2-binary
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy SDK so Celery tasks can import llm_obs.pii
-COPY ../sdk /app/sdk
+# Copy SDK first (from project root)
+COPY sdk /app/sdk
 RUN pip install --no-cache-dir /app/sdk
 
-COPY . .
+# Copy ingestion service
+COPY ingestion/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Entrypoint: run migrations then start server (or worker, overridden via compose command)
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY ingestion/app /app/app
+COPY ingestion/alembic /app/alembic
+COPY ingestion/alembic.ini /app/alembic.ini
+COPY ingestion/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 4000
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "4000"]

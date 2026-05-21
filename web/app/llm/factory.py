@@ -9,7 +9,21 @@ PROVIDER_MODELS = {
     "openai": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"],
     "anthropic": ["claude-3-5-haiku-latest", "claude-3-5-sonnet-latest", "claude-sonnet-4-5"],
     "google": ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"],
+    # Ollama models — populated dynamically from the running Ollama instance
+    "ollama": [],
 }
+
+# Common small models people run locally with Ollama
+OLLAMA_COMMON_MODELS = [
+    "llama3.2", "llama3.2:1b", "llama3.1", "llama3.1:8b",
+    "mistral", "mistral:7b", "mistral-nemo",
+    "gemma2", "gemma2:2b", "gemma2:9b",
+    "phi3", "phi3:mini",
+    "qwen2.5", "qwen2.5:7b",
+    "deepseek-r1:7b", "deepseek-r1:1.5b",
+    "codellama", "codellama:7b",
+    "nomic-embed-text",
+]
 
 
 async def stream_chat(
@@ -33,6 +47,9 @@ async def stream_chat(
             yield chunk
     elif provider == "google":
         async for chunk in _gemini_stream(model, messages, obs_client, conversation_id, cancel_event):
+            yield chunk
+    elif provider == "ollama":
+        async for chunk in _ollama_stream(model, messages, obs_client, conversation_id, cancel_event):
             yield chunk
     else:
         raise ValueError(f"Unknown provider: {provider}")
@@ -174,6 +191,56 @@ async def _gemini_stream(model, messages, obs_client, conv_id, cancel_event):
         raise
 
 
+async def _ollama_stream(model, messages, obs_client, conv_id, cancel_event):
+    """
+    Ollama exposes an OpenAI-compatible API at /v1 — we reuse the OpenAI async client
+    pointed at the Ollama base URL. No real API key required ('ollama' is the dummy).
+    """
+    import time
+    from openai import AsyncOpenAI
+
+    base_url = (settings.ollama_base_url or "http://localhost:11434").rstrip("/") + "/v1"
+    client = AsyncOpenAI(base_url=base_url, api_key="ollama")
+
+    started = time.monotonic()
+    started_iso = _now_iso()
+    span_id = _new_id()
+    first_token = True
+    ttft_ms = None
+    output_chunks = []
+
+    try:
+        stream = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            stream=True,
+        )
+        async for chunk in stream:
+            if cancel_event and cancel_event.is_set():
+                await stream.close()
+                _send_log(obs_client, span_id, "ollama", model, conv_id, messages,
+                          output_chunks, None, "cancelled", started, started_iso, ttft_ms, True)
+                return
+
+            if chunk.choices:
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    if first_token:
+                        ttft_ms = int((time.monotonic() - started) * 1000)
+                        first_token = False
+                    output_chunks.append(delta.content)
+                    yield delta.content
+
+        _send_log(obs_client, span_id, "ollama", model, conv_id, messages,
+                  output_chunks, None, "success", started, started_iso, ttft_ms, True)
+
+    except Exception as exc:
+        _send_log(obs_client, span_id, "ollama", model, conv_id, messages,
+                  output_chunks, None, "error", started, started_iso, ttft_ms, True,
+                  error={"type": type(exc).__name__, "message": str(exc)[:500]})
+        raise
+
+
 def _send_log(obs_client, span_id, provider, model, conv_id, messages,
               output_chunks, usage, status, started, started_iso, ttft_ms, streamed, error=None):
     if not obs_client:
@@ -220,8 +287,8 @@ def _new_id() -> str:
         return str(uuid.uuid4())
 
 
-def get_provider_client():
-    """Returns available providers based on configured API keys."""
+def get_provider_client() -> dict[str, list[str]]:
+    """Returns available providers based on configured API keys + Ollama discovery."""
     available = {}
     if settings.openai_api_key:
         available["openai"] = PROVIDER_MODELS["openai"]
@@ -229,4 +296,31 @@ def get_provider_client():
         available["anthropic"] = PROVIDER_MODELS["anthropic"]
     if settings.google_api_key:
         available["google"] = PROVIDER_MODELS["google"]
+
+    # Check Ollama — it doesn't need an API key; just needs to be running
+    if settings.ollama_base_url:
+        models = _discover_ollama_models(settings.ollama_base_url)
+        if models:
+            available["ollama"] = models
+
     return available
+
+
+def _discover_ollama_models(base_url: str) -> list[str]:
+    """
+    Call GET /api/tags on the Ollama server to list pulled models.
+    Falls back to a common list if the endpoint is reachable but returns unexpected data.
+    Returns [] if Ollama is not reachable.
+    """
+    import httpx
+
+    url = base_url.rstrip("/") + "/api/tags"
+    try:
+        resp = httpx.get(url, timeout=2.0)
+        if resp.status_code == 200:
+            data = resp.json()
+            models = [m["name"] for m in data.get("models", [])]
+            return models if models else OLLAMA_COMMON_MODELS
+    except Exception:
+        pass
+    return []

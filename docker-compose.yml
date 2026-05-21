@@ -20,8 +20,8 @@ services:
 
   ingestion:
     build:
-      context: ./ingestion
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ingestion/Dockerfile
     environment:
       DATABASE_URL: postgresql+asyncpg://obs:obs@postgres:5432/obs
       REDIS_URL: redis://redis:6379/0
@@ -38,8 +38,8 @@ services:
 
   worker:
     build:
-      context: ./ingestion
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ingestion/Dockerfile
     command: celery -A app.worker worker -l info -c 4
     environment:
       DATABASE_URL: postgresql+asyncpg://obs:obs@postgres:5432/obs
@@ -54,8 +54,8 @@ services:
 
   web:
     build:
-      context: ./web
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: web/Dockerfile
     environment:
       DATABASE_URL: postgresql+asyncpg://obs:obs@postgres:5432/obs
       INGEST_URL: http://ingestion:4000
@@ -63,6 +63,8 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      # For Ollama running on your Mac host, use host.docker.internal
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       ENVIRONMENT: prod
     depends_on:
       ingestion:
