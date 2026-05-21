@@ -15,6 +15,7 @@ PROVIDER_MODELS = {
 
 # Common small models people run locally with Ollama
 OLLAMA_COMMON_MODELS = [
+    "gemma3:4b", "gemma3:1b", "gemma3:12b",
     "llama3.2", "llama3.2:1b", "llama3.1", "llama3.1:8b",
     "mistral", "mistral:7b", "mistral-nemo",
     "gemma2", "gemma2:2b", "gemma2:9b",
@@ -22,7 +23,6 @@ OLLAMA_COMMON_MODELS = [
     "qwen2.5", "qwen2.5:7b",
     "deepseek-r1:7b", "deepseek-r1:1.5b",
     "codellama", "codellama:7b",
-    "nomic-embed-text",
 ]
 
 
@@ -297,11 +297,11 @@ def get_provider_client() -> dict[str, list[str]]:
     if settings.google_api_key:
         available["google"] = PROVIDER_MODELS["google"]
 
-    # Check Ollama — it doesn't need an API key; just needs to be running
+    # Check Ollama — no API key needed, just needs OLLAMA_BASE_URL set
     if settings.ollama_base_url:
         models = _discover_ollama_models(settings.ollama_base_url)
-        if models:
-            available["ollama"] = models
+        # Always show Ollama if URL is configured, even if discovery fails
+        available["ollama"] = models if models else OLLAMA_COMMON_MODELS
 
     return available
 
@@ -309,8 +309,7 @@ def get_provider_client() -> dict[str, list[str]]:
 def _discover_ollama_models(base_url: str) -> list[str]:
     """
     Call GET /api/tags on the Ollama server to list pulled models.
-    Falls back to a common list if the endpoint is reachable but returns unexpected data.
-    Returns [] if Ollama is not reachable.
+    Returns the pulled model names, or [] if Ollama is unreachable.
     """
     import httpx
 
@@ -320,7 +319,7 @@ def _discover_ollama_models(base_url: str) -> list[str]:
         if resp.status_code == 200:
             data = resp.json()
             models = [m["name"] for m in data.get("models", [])]
-            return models if models else OLLAMA_COMMON_MODELS
+            return models  # may be empty if nothing is pulled
     except Exception:
         pass
     return []

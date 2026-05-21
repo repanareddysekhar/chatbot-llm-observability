@@ -20,6 +20,9 @@ def _redact_string(text: str) -> tuple[str, dict[str, int]]:
                 if not (13 <= len(digits_only) <= 19 and luhn_valid(digits_only)):
                     return raw
             detections[p.name] = detections.get(p.name, 0) + 1
+            # Support backreferences (e.g. r"\1[REDACTED]") in placeholder
+            if r"\1" in p.placeholder:
+                return m.expand(p.placeholder)
             return p.placeholder
 
         text = pii.pattern.sub(replace, text)

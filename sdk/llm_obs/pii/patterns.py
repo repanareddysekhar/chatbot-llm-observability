@@ -47,7 +47,8 @@ PATTERNS: list[PIIPattern] = [
     ),
     PIIPattern(
         name="url_secret",
-        pattern=_compile(r"(?<=(?:token|apikey|api_key|password|secret|key)=)[^\s&\"']+"),
-        placeholder="[REDACTED]",
+        # Capture the key name in group 1, redact only the value
+        pattern=_compile(r"((?:token|api_?key|password|secret|key)=)[^\s&\"']+"),
+        placeholder=r"\1[REDACTED]",
     ),
 ]

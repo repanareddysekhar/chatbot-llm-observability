@@ -39,7 +39,9 @@ async def root():
 async def chat_page(request: Request, conv_id: str | None = None):
     providers = get_provider_client()
     if not providers:
-        providers = {"openai": ["gpt-4o-mini"]}  # fallback so UI renders
+        # If nothing is configured, at least show Ollama with common models
+        # so the UI is usable without any cloud API keys
+        providers = {"ollama": ["gemma3:4b", "llama3.2", "mistral"]}
     return templates.TemplateResponse(
         "chat.html",
         {
