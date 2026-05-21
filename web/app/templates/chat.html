@@ -2,6 +2,30 @@
 {% block title %}Chat — LLM Obs{% endblock %}
 
 {% block content %}
+<style>
+  /* Markdown prose styles for assistant messages */
+  .prose p               { margin: 0.5em 0; }
+  .prose p:first-child   { margin-top: 0; }
+  .prose p:last-child    { margin-bottom: 0; }
+  .prose ul, .prose ol   { margin: 0.5em 0 0.5em 1.25em; }
+  .prose li              { margin: 0.2em 0; }
+  .prose strong          { font-weight: 700; }
+  .prose em              { font-style: italic; }
+  .prose h1,.prose h2,.prose h3 { font-weight: 700; margin: 0.75em 0 0.25em; line-height: 1.3; }
+  .prose h1              { font-size: 1.2em; }
+  .prose h2              { font-size: 1.1em; }
+  .prose h3              { font-size: 1em; }
+  .prose code            { background: #f3f4f6; border-radius: 3px; padding: 0.1em 0.3em; font-family: monospace; font-size: 0.88em; }
+  .prose pre             { background: #1e1e2e; color: #cdd6f4; border-radius: 6px; padding: 0.75em 1em; overflow-x: auto; margin: 0.5em 0; }
+  .prose pre code        { background: none; padding: 0; color: inherit; font-size: 0.85em; }
+  .prose blockquote      { border-left: 3px solid #e5e7eb; padding-left: 0.75em; color: #6b7280; margin: 0.5em 0; }
+  .prose a               { color: #4f46e5; text-decoration: underline; }
+  .prose hr              { border: none; border-top: 1px solid #e5e7eb; margin: 0.75em 0; }
+  .prose table           { border-collapse: collapse; width: 100%; margin: 0.5em 0; font-size: 0.9em; }
+  .prose th, .prose td   { border: 1px solid #e5e7eb; padding: 0.3em 0.6em; text-align: left; }
+  .prose th              { background: #f9fafb; font-weight: 600; }
+</style>
+
 <div class="flex h-screen">
   <!-- Conversation list -->
   <div class="w-64 bg-white border-r border-gray-200 flex flex-col">
@@ -16,9 +40,9 @@
   </div>
 
   <!-- Chat panel -->
-  <div class="flex-1 flex flex-col">
+  <div class="flex-1 flex flex-col overflow-hidden">
     <!-- Header -->
-    <div class="bg-white border-b px-6 py-3 flex items-center gap-4">
+    <div class="bg-white border-b px-6 py-3 flex items-center gap-4 flex-shrink-0">
       <select id="provider-select" class="border rounded px-2 py-1 text-sm" onchange="onProviderChange()">
         {% for p, models in providers.items() %}
         <option value="{{ p }}">{{ p|capitalize }}</option>
@@ -45,7 +69,7 @@
     </div>
 
     <!-- Input -->
-    <div class="bg-white border-t p-4">
+    <div class="bg-white border-t p-4 flex-shrink-0">
       <div class="flex gap-2">
         <textarea
           id="msg-input"
@@ -62,11 +86,19 @@
   </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
 <script>
+// Configure marked for safe inline rendering
+marked.setOptions({ breaks: true, gfm: true });
+
 const providers = {{ providers_json | safe }};
 let currentConvId = "{{ conv_id or '' }}";
 let currentInferenceLogId = null;
 let activeProvider = Object.keys(providers)[0] || "openai";
+
+function renderMarkdown(text) {
+  return marked.parse(text || "");
+}
 
 // Load conversations sidebar
 async function loadConversations() {
@@ -88,7 +120,7 @@ async function loadConversation(convId) {
   const msgs = document.getElementById("messages");
   document.getElementById("empty-state")?.remove();
   msgs.innerHTML = "";
-  (data.messages || []).forEach(m => appendMessage(m.role.toLowerCase(), m.content));
+  (data.messages || []).forEach(m => appendMessage(m.role.toLowerCase(), m.content, false));
   loadConversations();
   history.replaceState({}, "", `/chat/${convId}`);
 }
@@ -132,7 +164,8 @@ async function sendMessage() {
 
   appendMessage("user", text);
   const assistantDiv = appendMessage("assistant", "");
-  assistantDiv.querySelector(".content").innerHTML = '<span class="spinner"></span>';
+  const contentEl = assistantDiv.querySelector(".content");
+  contentEl.innerHTML = '<span class="spinner"></span>';
 
   document.getElementById("status-indicator").textContent = "Streaming…";
   document.getElementById("cancel-btn").classList.remove("hidden");
@@ -145,28 +178,53 @@ async function sendMessage() {
   }));
 
   let buffer = "";
+
   es.addEventListener("meta", e => {
     const d = JSON.parse(e.data);
     currentConvId = d.conversation_id;
     currentInferenceLogId = d.inference_log_id;
   });
+
   es.addEventListener("token", e => {
     const d = JSON.parse(e.data);
     buffer += d.delta;
-    assistantDiv.querySelector(".content").textContent = buffer;
-    assistantDiv.scrollIntoView({ behavior: "smooth" });
+    // Render markdown live as tokens stream in
+    contentEl.innerHTML = renderMarkdown(buffer);
+    contentEl.className = "content prose text-sm";
+    assistantDiv.scrollIntoView({ behavior: "smooth", block: "end" });
   });
-  es.addEventListener("done", () => { finishStream(es); });
+
+  es.addEventListener("done", () => {
+    // Final render once complete
+    contentEl.innerHTML = renderMarkdown(buffer);
+    contentEl.className = "content prose text-sm";
+    finishStream(es);
+  });
+
   es.addEventListener("cancelled", () => {
-    assistantDiv.querySelector(".content").textContent = buffer + " [cancelled]";
+    contentEl.innerHTML = renderMarkdown(buffer) + '<p class="text-xs text-gray-400 mt-1">[cancelled]</p>';
+    contentEl.className = "content prose text-sm";
     finishStream(es);
   });
+
   es.addEventListener("error", e => {
-    const d = JSON.parse(e.data || "{}");
-    assistantDiv.querySelector(".content").textContent = "Error: " + (d.message || "Unknown");
+    try {
+      const d = JSON.parse(e.data || "{}");
+      contentEl.textContent = "Error: " + (d.message || "Unknown error");
+    } catch {
+      contentEl.textContent = "Connection error";
+    }
+    contentEl.className = "content text-sm text-red-500";
     finishStream(es);
   });
-  es.onerror = () => finishStream(es);
+
+  es.onerror = () => {
+    if (buffer) {
+      contentEl.innerHTML = renderMarkdown(buffer);
+      contentEl.className = "content prose text-sm";
+    }
+    finishStream(es);
+  };
 }
 
 function finishStream(es) {
@@ -186,24 +244,31 @@ async function cancelChat() {
   });
 }
 
-function appendMessage(role, content) {
+function appendMessage(role, content, scroll = true) {
   const msgs = document.getElementById("messages");
   const div = document.createElement("div");
   div.className = `flex ${role === "user" ? "justify-end" : "justify-start"}`;
+
+  const isUser = role === "user";
+  const contentHtml = isUser
+    ? `<span>${escHtml(content)}</span>`
+    : `<div class="content prose text-sm">${renderMarkdown(content)}</div>`;
+
   div.innerHTML = `
-    <div class="max-w-2xl rounded-lg px-4 py-3 text-sm ${role === "user" ? "bg-indigo-600 text-white" : "bg-white border border-gray-200"}">
-      <div class="text-xs mb-1 opacity-60">${role}</div>
-      <div class="content">${escHtml(content)}</div>
+    <div class="max-w-2xl rounded-lg px-4 py-3 text-sm ${isUser ? "bg-indigo-600 text-white" : "bg-white border border-gray-200"}">
+      <div class="text-xs mb-1 opacity-50 font-medium">${role}</div>
+      ${contentHtml}
     </div>
   `;
   msgs.appendChild(div);
-  div.scrollIntoView({ behavior: "smooth" });
+  if (scroll) div.scrollIntoView({ behavior: "smooth", block: "end" });
   return div;
 }
 
 function escHtml(t) {
   return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
+
 function timeAgo(iso) {
   const d = Math.floor((Date.now() - new Date(iso)) / 60000);
   if (d < 1) return "just now";
