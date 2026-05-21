@@ -117,10 +117,20 @@ async def _anthropic_stream(model, messages, obs_client, conv_id, cancel_event):
     output_chunks = []
     usage = {}
 
+    # Anthropic requires system prompt as a top-level param, not in messages array
+    system_prompt = None
+    anthropic_messages = []
+    for m in messages:
+        if m["role"] == "system":
+            system_prompt = m["content"]
+        else:
+            anthropic_messages.append(m)
+
     try:
-        async with client.messages.stream(
-            model=model, messages=messages, max_tokens=2048
-        ) as stream:
+        stream_kwargs: dict = {"model": model, "messages": anthropic_messages, "max_tokens": 2048}
+        if system_prompt:
+            stream_kwargs["system"] = system_prompt
+        async with client.messages.stream(**stream_kwargs) as stream:
             async for text in stream.text_stream:
                 if cancel_event and cancel_event.is_set():
                     _send_log(obs_client, span_id, "anthropic", model, conv_id, messages,
@@ -149,13 +159,31 @@ async def _anthropic_stream(model, messages, obs_client, conv_id, cancel_event):
 async def _gemini_stream(model, messages, obs_client, conv_id, cancel_event):
     import asyncio
     import time
+    import queue
+    import threading
     import google.generativeai as genai
 
     genai.configure(api_key=settings.google_api_key)
-    gemini_model = genai.GenerativeModel(model)
 
-    # Convert messages to Gemini format
-    prompt = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
+    # Separate system prompt from conversation history
+    system_parts = [m["content"] for m in messages if m["role"] == "system"]
+    system_instruction = system_parts[0] if system_parts else None
+
+    gemini_model = genai.GenerativeModel(
+        model,
+        system_instruction=system_instruction,
+    )
+
+    # Build proper Gemini history (all turns except the last user message)
+    convo_messages = [m for m in messages if m["role"] != "system"]
+    history = []
+    for m in convo_messages[:-1]:
+        # Gemini uses "model" for assistant turns, not "assistant"
+        role = "model" if m["role"] == "assistant" else "user"
+        history.append({"role": role, "parts": [m["content"]]})
+
+    last_user_msg = convo_messages[-1]["content"] if convo_messages else ""
+    chat = gemini_model.start_chat(history=history)
 
     started = time.monotonic()
     started_iso = _now_iso()
@@ -164,25 +192,68 @@ async def _gemini_stream(model, messages, obs_client, conv_id, cancel_event):
     ttft_ms = None
     output_chunks = []
 
-    try:
-        response = await asyncio.to_thread(
-            gemini_model.generate_content, prompt, stream=True
-        )
-        for chunk in response:
-            if cancel_event and cancel_event.is_set():
-                _send_log(obs_client, span_id, "google", model, conv_id, messages,
-                          output_chunks, None, "cancelled", started, started_iso, ttft_ms, True)
-                return
-            text = chunk.text if hasattr(chunk, "text") else ""
-            if text:
-                if first_token:
-                    ttft_ms = int((time.monotonic() - started) * 1000)
-                    first_token = False
-                output_chunks.append(text)
-                yield text
+    # Run the blocking streaming call in a thread; pipe chunks via a queue
+    chunk_queue: queue.Queue = queue.Queue()
+    _DONE = object()
 
-        _send_log(obs_client, span_id, "google", model, conv_id, messages,
-                  output_chunks, None, "success", started, started_iso, ttft_ms, True)
+    def _run_stream():
+        try:
+            response = chat.send_message(last_user_msg, stream=True)
+            usage = None
+            for chunk in response:
+                text = ""
+                try:
+                    text = chunk.text
+                except Exception:
+                    pass
+                chunk_queue.put(("chunk", text))
+            # usage_metadata available after iteration is complete
+            try:
+                um = response.usage_metadata
+                usage = {
+                    "prompt_tokens": um.prompt_token_count,
+                    "completion_tokens": um.candidates_token_count,
+                }
+            except Exception:
+                pass
+            chunk_queue.put(("done", usage))
+        except Exception as exc:
+            chunk_queue.put(("error", exc))
+
+    thread = threading.Thread(target=_run_stream, daemon=True)
+    thread.start()
+
+    try:
+        while True:
+            try:
+                kind, value = await asyncio.to_thread(chunk_queue.get, True, 0.05)
+            except queue.Empty:
+                if cancel_event and cancel_event.is_set():
+                    _send_log(obs_client, span_id, "google", model, conv_id, messages,
+                              output_chunks, None, "cancelled", started, started_iso, ttft_ms, True)
+                    return
+                continue
+
+            if kind == "chunk":
+                if cancel_event and cancel_event.is_set():
+                    _send_log(obs_client, span_id, "google", model, conv_id, messages,
+                              output_chunks, None, "cancelled", started, started_iso, ttft_ms, True)
+                    return
+                if value:
+                    if first_token:
+                        ttft_ms = int((time.monotonic() - started) * 1000)
+                        first_token = False
+                    output_chunks.append(value)
+                    yield value
+
+            elif kind == "done":
+                usage = value  # may be None
+                _send_log(obs_client, span_id, "google", model, conv_id, messages,
+                          output_chunks, usage, "success", started, started_iso, ttft_ms, True)
+                return
+
+            elif kind == "error":
+                raise value
 
     except Exception as exc:
         _send_log(obs_client, span_id, "google", model, conv_id, messages,
