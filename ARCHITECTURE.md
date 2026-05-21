@@ -606,11 +606,139 @@ flowchart LR
 
 ---
 
-## 14. What Would Improve With More Time
+## 14. Ingestion Flow
+
+Every LLM call goes through a two-stage pipeline: **capture → async process**.
+
+```
+LLM Call
+   │
+   ▼
+llm_obs SDK  (runs inside web service)
+   │  Wraps openai / anthropic / google-generativeai clients via monkey-patching
+   │  Captures: model, provider, latency, TTFT, tokens, status, request/response
+   │  Buffers payloads in memory (flush every 20 events or every 2s)
+   │
+   ▼  POST /v1/ingest/batch  (fire-and-forget, retries up to 3×)
+   │
+ingestion/ FastAPI  (:4000)
+   │  1. Validate payload with Pydantic
+   │  2. Write raw event to inference_events (audit row)
+   │  3. Enqueue Celery job → Redis broker
+   │  → returns 202 Accepted immediately (chat streaming is never blocked)
+   │
+   ▼  Celery job (async, off the hot path)
+   │
+Worker
+   │  1. PII redact — request + response payloads via regex + Luhn
+   │  2. Compute cost_usd from provider price table
+   │  3. Derive input_preview, output_preview (256 chars), input_hash (sha256)
+   │  4. UPSERT inference_logs (idempotent — ULID primary key)
+   │  5. UPDATE inference_events → status = PROCESSED
+   │  6. PUBLISH lean row to Redis channel "metrics.events"
+   │
+   ▼
+Dashboard SSE consumers pick up the Redis pub/sub message → live feed updates
+```
+
+**Why two stages?** The chat streaming hot path never waits for DB writes. The worker handles heavy work (PII, cost, hashing) asynchronously. The `inference_events` table is a replay buffer — if the worker had a bug, reset `status='RECEIVED'` and re-enqueue.
+
+---
+
+## 15. Logging Strategy
+
+### What gets captured per call
+
+| Field | Description |
+|---|---|
+| `provider` / `model` | Who served the request |
+| `latency_ms` | Total wall-clock time |
+| `ttft_ms` | Time-to-first-token (streaming calls only) |
+| `prompt_tokens` / `completion_tokens` | Token usage from provider |
+| `cost_usd` | Computed from hardcoded price table |
+| `status` | `SUCCESS`, `ERROR`, `CANCELLED`, `TIMEOUT` |
+| `error_type` | e.g. `rate_limit`, `context_length` |
+| `input_preview` / `output_preview` | First 256 chars, PII-redacted |
+| `request_payload` / `response_payload` | Full JSONB, PII-redacted |
+| `pii_detections` | `[{type: "email", count: 2}]` per log |
+
+### Non-intrusive by design
+
+The SDK monkey-patches the LLM client's `create` method once at startup. Application code calls the LLM exactly as before; the SDK intercepts transparently, measures, and ships the log via a background thread. Any SDK failure (network error, crash) is caught and swallowed — **it never breaks the LLM call itself**.
+
+### PII before persistence
+
+Redaction runs in the Celery worker **before** any data touches `inference_logs`. The `inference_events` table holds the raw payload temporarily and can be purged after processing. Detectors cover: email, phone, SSN, credit card (with Luhn), IPv4, API keys (OpenAI/Anthropic/AWS patterns), URL query secrets.
+
+### Conversation context vs observability
+
+Messages store both `content` (raw — used for multi-turn LLM context) and `content_redacted` (PII-scrubbed — used in dashboards). This keeps the chatbot accurate while keeping the observability layer privacy-safe.
+
+---
+
+## 16. Scaling Considerations
+
+### What scales easily
+
+- **`web/`** and **`ingestion/`** are stateless FastAPI apps — add replicas behind a load balancer with no changes
+- **Celery workers** are stateless consumers — scale horizontally by adding containers; Redis distributes work automatically
+- **SDK batching** absorbs bursts — events buffer in memory and flush every 2s or 20 events
+
+### What becomes a bottleneck first
+
+| Component | Bottleneck | Mitigation |
+|---|---|---|
+| PostgreSQL | Analytics queries on large `inference_logs` ranges | Pre-aggregate `metric_rollups` via Celery Beat; migrate to ClickHouse for analytics |
+| Redis queue | In-memory only — no persistence on crash | Replace with Kafka for durable delivery |
+| `inference_events` | Unbounded growth of raw payloads | Partition by `received_at`; purge rows after processing |
+| PII regex | CPU-bound at very high volume | Dedicated PII service; cache by `input_hash` |
+
+### Honest POC capacity bounds
+
+- Single Postgres: ~1,000 inference logs/min comfortably
+- Single Redis: ~10,000 pub/sub messages/sec
+- Celery (4 concurrency, 1 worker): ~200 jobs/min
+
+---
+
+## 17. Failure Handling
+
+### SDK → Ingestion
+
+| Failure | Behaviour |
+|---|---|
+| Ingestion API down | `BatchTransport` retries 3× with exponential backoff (250ms → 2s → 4s). After all retries, event is **silently dropped** — logging must never break the application |
+| SDK crash / process exit | In-memory buffer is lost for that window |
+
+### Ingestion → Worker
+
+| Failure | Behaviour |
+|---|---|
+| Worker crashes mid-job | `task_acks_late=True` — job is re-queued automatically before ACK |
+| Worker throws an exception | Auto-retry up to 5× with backoff; `inference_events.status = FAILED` after all retries |
+| Replay after a bad deploy | `UPDATE inference_events SET status='RECEIVED' WHERE status='FAILED'` then re-enqueue |
+
+### Database
+
+| Failure | Behaviour |
+|---|---|
+| Postgres down briefly | Services fail fast; Celery jobs stay in Redis and process when Postgres recovers |
+| Duplicate ingest | `ON CONFLICT (id) DO UPDATE` — safe to ingest the same ULID multiple times |
+| Partial worker run | Upsert is atomic per row; crash leaves event as `RECEIVED` and job retries clean |
+
+### Assumptions
+
+- **At-least-once delivery** is acceptable — a log may be processed twice (idempotent upsert handles it)
+- **Best-effort SDK** — if the observability system is fully down, the product keeps working; that window of logs is lost, not queued indefinitely
+- **Redis is available** — no fallback if Redis is down; queue and pub/sub both stop until it recovers
+
+---
+
+## 18. What Would Improve With More Time
 
 1. **Alembic auto-migrations** — commit versioned migration files so schema changes are tracked and reproducible
 2. **Authentication** — multi-tenant API key auth; user sessions per conversation
-3. **Metric rollup Celery Beat job** — periodic task to materialize `metric_rollups` every minute instead of live aggregation
+3. **Metric rollup Celery Beat job** — periodic task to materialise `metric_rollups` every minute instead of live aggregation
 4. **Full-text search** — `pg_trgm` index on `input_preview`/`output_preview` for log search
 5. **spaCy NER** — optional named-entity recognition for person/org PII (currently disabled due to FP rate)
 6. **Kubernetes manifests** — `Deployment` + `Service` + `HorizontalPodAutoscaler` YAML for the 3 app services
