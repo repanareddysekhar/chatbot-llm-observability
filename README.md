@@ -390,12 +390,3 @@ Pre-aggregated 1-minute buckets keyed by `(bucket, provider, model)`. Dashboard 
 | ✅ Resume a conversation | Full message history loaded; multi-turn context preserved |
 | ✅ Local model support | Ollama integration; auto-discovers pulled models via `/api/tags` |
 | ✅ Markdown rendering | `marked.js` renders LLM responses with proper formatting |
-
----
-
-## Submission
-
-Send to: **work@ollive.ai**
-- GitHub repo link
-- Architecture notes → [`ARCHITECTURE.md`](./ARCHITECTURE.md) ← system design, diagrams, ingestion flow, logging strategy, scaling, failure handling
-- Demo → `docker compose up --build` → http://localhost:3000
