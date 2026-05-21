@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{% block title %}LLM Observability{% endblock %}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; }
+    .sidebar { min-height: 100vh; }
+    pre { white-space: pre-wrap; word-break: break-word; }
+    .spinner { border: 2px solid #e5e7eb; border-top-color: #6366f1; border-radius: 50%; width: 1rem; height: 1rem; animation: spin 0.6s linear infinite; display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .status-success { color: #16a34a; }
+    .status-error   { color: #dc2626; }
+    .status-cancelled { color: #f59e0b; }
+  </style>
+</head>
+<body class="bg-gray-50 text-gray-900">
+  <div class="flex">
+    <!-- Sidebar -->
+    <nav class="w-56 bg-gray-900 text-gray-100 sidebar flex flex-col p-4 fixed top-0 left-0 h-full z-10">
+      <a href="/" class="text-lg font-bold text-indigo-400 mb-6">🔭 LLM Obs</a>
+      <a href="/chat" class="flex items-center gap-2 py-2 px-3 rounded hover:bg-gray-700 mb-1 text-sm {% if active == 'chat' %}bg-gray-700{% endif %}">
+        💬 Chat
+      </a>
+      <a href="/dashboard" class="flex items-center gap-2 py-2 px-3 rounded hover:bg-gray-700 mb-1 text-sm {% if active == 'dashboard' %}bg-gray-700{% endif %}">
+        📊 Dashboard
+      </a>
+      <a href="/logs" class="flex items-center gap-2 py-2 px-3 rounded hover:bg-gray-700 mb-1 text-sm {% if active == 'logs' %}bg-gray-700{% endif %}">
+        📋 Logs
+      </a>
+    </nav>
+
+    <!-- Main content -->
+    <main class="ml-56 flex-1 min-h-screen">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>

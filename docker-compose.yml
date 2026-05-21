@@ -1,0 +1,78 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: obs
+      POSTGRES_PASSWORD: obs
+      POSTGRES_DB: obs
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U obs"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  ingestion:
+    build:
+      context: ./ingestion
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://obs:obs@postgres:5432/obs
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      INGEST_API_KEY: dev-key
+      ENVIRONMENT: prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports: ["4000:4000"]
+
+  worker:
+    build:
+      context: ./ingestion
+      dockerfile: Dockerfile
+    command: celery -A app.worker worker -l info -c 4
+    environment:
+      DATABASE_URL: postgresql+asyncpg://obs:obs@postgres:5432/obs
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://obs:obs@postgres:5432/obs
+      INGEST_URL: http://ingestion:4000
+      INGEST_API_KEY: dev-key
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      ENVIRONMENT: prod
+    depends_on:
+      ingestion:
+        condition: service_started
+    ports: ["3000:3000"]
+
+  adminer:
+    image: adminer:4
+    ports: ["8080:8080"]
+    depends_on: [postgres]
+
+volumes:
+  pgdata:

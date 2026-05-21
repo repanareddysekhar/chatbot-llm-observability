@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+{% block title %}Logs — LLM Obs{% endblock %}
+
+{% block content %}
+<div class="p-6">
+  <h1 class="text-xl font-bold mb-4">Inference Logs</h1>
+
+  <!-- Filters -->
+  <div class="flex gap-3 mb-4 flex-wrap">
+    <select id="f-provider" class="border rounded px-2 py-1 text-sm">
+      <option value="">All Providers</option>
+      <option>openai</option><option>anthropic</option><option>google</option>
+    </select>
+    <select id="f-status" class="border rounded px-2 py-1 text-sm">
+      <option value="">All Statuses</option>
+      <option>success</option><option>error</option><option>cancelled</option>
+    </select>
+    <button onclick="loadLogs()" class="bg-indigo-600 text-white px-3 py-1 rounded text-sm hover:bg-indigo-700">
+      Filter
+    </button>
+  </div>
+
+  <!-- Table -->
+  <div class="bg-white rounded-lg border overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="bg-gray-50 border-b text-xs text-gray-500">
+        <tr>
+          <th class="px-4 py-2 text-left">Time</th>
+          <th class="px-4 py-2 text-left">Provider / Model</th>
+          <th class="px-4 py-2 text-left">Status</th>
+          <th class="px-4 py-2 text-right">Latency</th>
+          <th class="px-4 py-2 text-right">Tokens</th>
+          <th class="px-4 py-2 text-right">Cost</th>
+          <th class="px-4 py-2 text-left">Preview</th>
+        </tr>
+      </thead>
+      <tbody id="logs-body" class="divide-y divide-gray-100">
+        <tr><td colspan="7" class="text-center py-8 text-gray-400">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div id="load-more-wrap" class="mt-4 text-center hidden">
+    <button onclick="loadMore()" class="text-sm text-indigo-600 hover:underline">Load more</button>
+  </div>
+</div>
+
+<!-- Log detail modal -->
+<div id="modal" class="fixed inset-0 bg-black/50 hidden z-50 flex items-center justify-center p-4">
+  <div class="bg-white rounded-lg w-full max-w-3xl max-h-screen overflow-y-auto p-6 relative">
+    <button onclick="closeModal()" class="absolute top-4 right-4 text-gray-400 hover:text-gray-700 text-xl">✕</button>
+    <div id="modal-content"></div>
+  </div>
+</div>
+
+<script>
+let nextCursor = null;
+
+async function loadLogs(append = false) {
+  const provider = document.getElementById("f-provider").value;
+  const status = document.getElementById("f-status").value;
+
+  const params = new URLSearchParams({ limit: 50 });
+  if (provider) params.set("provider", provider);
+  if (status)   params.set("status", status);
+  if (append && nextCursor) params.set("cursor", nextCursor);
+
+  const resp = await fetch("/api/dashboard/logs?" + params);
+  const data = await resp.json();
+
+  nextCursor = data.next_cursor;
+  document.getElementById("load-more-wrap").classList.toggle("hidden", !nextCursor);
+
+  const body = document.getElementById("logs-body");
+  if (!append) body.innerHTML = "";
+
+  if (!data.items?.length && !append) {
+    body.innerHTML = '<tr><td colspan="7" class="text-center py-8 text-gray-400">No logs found</td></tr>';
+    return;
+  }
+
+  data.items.forEach(log => {
+    const tr = document.createElement("tr");
+    tr.className = "hover:bg-gray-50 cursor-pointer";
+    tr.onclick = () => showDetail(log.id);
+    const statusColor = log.status === "SUCCESS" ? "text-green-600" : log.status === "ERROR" ? "text-red-500" : "text-yellow-500";
+    tr.innerHTML = `
+      <td class="px-4 py-2 text-xs text-gray-500 whitespace-nowrap">${new Date(log.created_at).toLocaleString()}</td>
+      <td class="px-4 py-2"><span class="font-medium">${log.provider}</span> / ${log.model}</td>
+      <td class="px-4 py-2"><span class="${statusColor} text-xs font-medium">${log.status}</span></td>
+      <td class="px-4 py-2 text-right">${log.latency_ms}ms</td>
+      <td class="px-4 py-2 text-right text-gray-500">${log.total_tokens ?? "—"}</td>
+      <td class="px-4 py-2 text-right text-green-600">${log.cost_usd ? "$"+parseFloat(log.cost_usd).toFixed(5) : "—"}</td>
+      <td class="px-4 py-2 text-xs text-gray-400 max-w-xs truncate">${escHtml(log.input_preview || "")}</td>
+    `;
+    body.appendChild(tr);
+  });
+}
+
+function loadMore() {
+  loadLogs(true);
+}
+
+async function showDetail(logId) {
+  const resp = await fetch(`/api/dashboard/logs/${logId}`);
+  const log = await resp.json();
+  const statusColor = log.status === "SUCCESS" ? "text-green-600" : log.status === "ERROR" ? "text-red-500" : "text-yellow-500";
+
+  document.getElementById("modal-content").innerHTML = `
+    <h2 class="text-lg font-bold mb-4">Log Detail</h2>
+    <div class="grid grid-cols-3 gap-3 mb-4 text-sm">
+      <div><span class="text-gray-500">Provider/Model</span><br><strong>${log.provider} / ${log.model}</strong></div>
+      <div><span class="text-gray-500">Status</span><br><strong class="${statusColor}">${log.status}</strong></div>
+      <div><span class="text-gray-500">Latency</span><br><strong>${log.latency_ms}ms ${log.ttft_ms ? `(TTFT: ${log.ttft_ms}ms)` : ""}</strong></div>
+      <div><span class="text-gray-500">Tokens</span><br><strong>${log.prompt_tokens || "—"} → ${log.completion_tokens || "—"}</strong></div>
+      <div><span class="text-gray-500">Cost</span><br><strong>${log.cost_usd ? "$"+parseFloat(log.cost_usd).toFixed(6) : "—"}</strong></div>
+      <div><span class="text-gray-500">Streamed</span><br><strong>${log.streamed ? "Yes" : "No"}</strong></div>
+    </div>
+    ${log.pii_detections?.length ? `<div class="mb-3 p-2 bg-yellow-50 border border-yellow-200 rounded text-sm text-yellow-800">
+      ⚠ PII detected: ${log.pii_detections.map(d => `${d.count}x ${d.type}`).join(", ")}
+    </div>` : ""}
+    <div class="mb-3">
+      <div class="text-xs text-gray-500 mb-1 font-medium">Input Preview</div>
+      <pre class="bg-gray-50 rounded p-3 text-xs">${escHtml(log.input_preview || "—")}</pre>
+    </div>
+    <div class="mb-3">
+      <div class="text-xs text-gray-500 mb-1 font-medium">Output Preview</div>
+      <pre class="bg-gray-50 rounded p-3 text-xs">${escHtml(log.output_preview || "—")}</pre>
+    </div>
+    ${log.error_type ? `<div class="mb-3 p-2 bg-red-50 border border-red-200 rounded text-sm">
+      <strong>Error:</strong> ${escHtml(log.error_type)}
+    </div>` : ""}
+  `;
+  document.getElementById("modal").classList.remove("hidden");
+}
+
+function closeModal() {
+  document.getElementById("modal").classList.add("hidden");
+}
+
+function escHtml(t) {
+  return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+loadLogs();
+</script>
+{% endblock %}

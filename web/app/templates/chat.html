@@ -1,0 +1,220 @@
+{% extends "base.html" %}
+{% block title %}Chat — LLM Obs{% endblock %}
+
+{% block content %}
+<div class="flex h-screen">
+  <!-- Conversation list -->
+  <div class="w-64 bg-white border-r border-gray-200 flex flex-col">
+    <div class="p-4 border-b">
+      <button onclick="newChat()" class="w-full bg-indigo-600 text-white rounded px-3 py-2 text-sm hover:bg-indigo-700">
+        + New Chat
+      </button>
+    </div>
+    <div id="conv-list" class="overflow-y-auto flex-1 p-2 space-y-1">
+      <!-- populated by JS -->
+    </div>
+  </div>
+
+  <!-- Chat panel -->
+  <div class="flex-1 flex flex-col">
+    <!-- Header -->
+    <div class="bg-white border-b px-6 py-3 flex items-center gap-4">
+      <select id="provider-select" class="border rounded px-2 py-1 text-sm" onchange="onProviderChange()">
+        {% for p, models in providers.items() %}
+        <option value="{{ p }}">{{ p|capitalize }}</option>
+        {% endfor %}
+      </select>
+      <select id="model-select" class="border rounded px-2 py-1 text-sm">
+        {% for p, models in providers.items() %}
+          {% for m in models %}
+          <option value="{{ m }}" data-provider="{{ p }}">{{ m }}</option>
+          {% endfor %}
+        {% endfor %}
+      </select>
+      <span id="status-indicator" class="text-xs text-gray-400"></span>
+      <button id="cancel-btn" onclick="cancelChat()" class="hidden ml-auto text-xs bg-red-100 text-red-600 px-3 py-1 rounded hover:bg-red-200">
+        ✕ Cancel
+      </button>
+    </div>
+
+    <!-- Messages -->
+    <div id="messages" class="flex-1 overflow-y-auto p-6 space-y-4">
+      <div class="text-center text-gray-400 text-sm mt-16" id="empty-state">
+        Start a conversation by typing a message below.
+      </div>
+    </div>
+
+    <!-- Input -->
+    <div class="bg-white border-t p-4">
+      <div class="flex gap-2">
+        <textarea
+          id="msg-input"
+          rows="2"
+          placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
+          class="flex-1 border rounded px-3 py-2 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-indigo-300"
+          onkeydown="handleKey(event)"
+        ></textarea>
+        <button onclick="sendMessage()" class="bg-indigo-600 text-white px-4 rounded hover:bg-indigo-700 text-sm">
+          Send
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const providers = {{ providers_json | safe }};
+let currentConvId = "{{ conv_id or '' }}";
+let currentInferenceLogId = null;
+let activeProvider = Object.keys(providers)[0] || "openai";
+
+// Load conversations sidebar
+async function loadConversations() {
+  const resp = await fetch("/api/conversations");
+  const convs = await resp.json();
+  const list = document.getElementById("conv-list");
+  list.innerHTML = convs.map(c => `
+    <div onclick="loadConversation('${c.id}')" class="p-2 rounded cursor-pointer text-sm hover:bg-gray-100 ${c.id === currentConvId ? 'bg-indigo-50 border-l-2 border-indigo-500' : ''}">
+      <div class="font-medium truncate">${escHtml(c.title)}</div>
+      <div class="text-xs text-gray-400">${c.provider || ''} • ${timeAgo(c.updated_at)}</div>
+    </div>
+  `).join("");
+}
+
+async function loadConversation(convId) {
+  currentConvId = convId;
+  const resp = await fetch(`/api/conversations/${convId}`);
+  const data = await resp.json();
+  const msgs = document.getElementById("messages");
+  document.getElementById("empty-state")?.remove();
+  msgs.innerHTML = "";
+  (data.messages || []).forEach(m => appendMessage(m.role.toLowerCase(), m.content));
+  loadConversations();
+  history.replaceState({}, "", `/chat/${convId}`);
+}
+
+function newChat() {
+  currentConvId = "";
+  currentInferenceLogId = null;
+  document.getElementById("messages").innerHTML = `
+    <div class="text-center text-gray-400 text-sm mt-16" id="empty-state">Start a conversation by typing a message below.</div>
+  `;
+  history.replaceState({}, "", "/chat");
+}
+
+function onProviderChange() {
+  const prov = document.getElementById("provider-select").value;
+  activeProvider = prov;
+  const modelSel = document.getElementById("model-select");
+  const opts = [...modelSel.options];
+  let first = true;
+  opts.forEach(o => {
+    const show = o.dataset.provider === prov;
+    o.style.display = show ? "" : "none";
+    if (show && first) { modelSel.value = o.value; first = false; }
+  });
+}
+
+function handleKey(e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+}
+
+async function sendMessage() {
+  const input = document.getElementById("msg-input");
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+
+  document.getElementById("empty-state")?.remove();
+
+  const provider = document.getElementById("provider-select").value;
+  const model = document.getElementById("model-select").value;
+
+  appendMessage("user", text);
+  const assistantDiv = appendMessage("assistant", "");
+  assistantDiv.querySelector(".content").innerHTML = '<span class="spinner"></span>';
+
+  document.getElementById("status-indicator").textContent = "Streaming…";
+  document.getElementById("cancel-btn").classList.remove("hidden");
+
+  const es = new EventSource("/api/chat-stream?" + new URLSearchParams({
+    message: text,
+    conversation_id: currentConvId,
+    provider,
+    model,
+  }));
+
+  let buffer = "";
+  es.addEventListener("meta", e => {
+    const d = JSON.parse(e.data);
+    currentConvId = d.conversation_id;
+    currentInferenceLogId = d.inference_log_id;
+  });
+  es.addEventListener("token", e => {
+    const d = JSON.parse(e.data);
+    buffer += d.delta;
+    assistantDiv.querySelector(".content").textContent = buffer;
+    assistantDiv.scrollIntoView({ behavior: "smooth" });
+  });
+  es.addEventListener("done", () => { finishStream(es); });
+  es.addEventListener("cancelled", () => {
+    assistantDiv.querySelector(".content").textContent = buffer + " [cancelled]";
+    finishStream(es);
+  });
+  es.addEventListener("error", e => {
+    const d = JSON.parse(e.data || "{}");
+    assistantDiv.querySelector(".content").textContent = "Error: " + (d.message || "Unknown");
+    finishStream(es);
+  });
+  es.onerror = () => finishStream(es);
+}
+
+function finishStream(es) {
+  es.close();
+  document.getElementById("status-indicator").textContent = "";
+  document.getElementById("cancel-btn").classList.add("hidden");
+  currentInferenceLogId = null;
+  loadConversations();
+}
+
+async function cancelChat() {
+  if (!currentConvId || !currentInferenceLogId) return;
+  await fetch(`/api/conversations/${currentConvId}/cancel`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ inference_log_id: currentInferenceLogId }),
+  });
+}
+
+function appendMessage(role, content) {
+  const msgs = document.getElementById("messages");
+  const div = document.createElement("div");
+  div.className = `flex ${role === "user" ? "justify-end" : "justify-start"}`;
+  div.innerHTML = `
+    <div class="max-w-2xl rounded-lg px-4 py-3 text-sm ${role === "user" ? "bg-indigo-600 text-white" : "bg-white border border-gray-200"}">
+      <div class="text-xs mb-1 opacity-60">${role}</div>
+      <div class="content">${escHtml(content)}</div>
+    </div>
+  `;
+  msgs.appendChild(div);
+  div.scrollIntoView({ behavior: "smooth" });
+  return div;
+}
+
+function escHtml(t) {
+  return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+function timeAgo(iso) {
+  const d = Math.floor((Date.now() - new Date(iso)) / 60000);
+  if (d < 1) return "just now";
+  if (d < 60) return `${d}m ago`;
+  if (d < 1440) return `${Math.floor(d/60)}h ago`;
+  return `${Math.floor(d/1440)}d ago`;
+}
+
+// Init
+onProviderChange();
+loadConversations();
+{% if conv_id %}loadConversation("{{ conv_id }}");{% endif %}
+</script>
+{% endblock %}
