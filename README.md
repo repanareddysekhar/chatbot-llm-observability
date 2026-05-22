@@ -10,16 +10,17 @@ Multi-provider chatbot · Streaming responses · PII redaction · Live metrics d
 
 1. [Quick Start](#quick-start)
 2. [Architecture Overview](#architecture-overview)
-3. [Services](#services)
-4. [Setup Instructions](#setup-instructions)
+3. [Data Flow Cheat Sheet](#data-flow-cheat-sheet)
+4. [Services](#services)
+5. [Setup Instructions](#setup-instructions)
   - [Docker Compose (recommended)](#option-a-docker-compose-recommended)
   - [Local Development](#option-b-local-development)
-5. [Configuration](#configuration)
-6. [SDK Usage](#sdk-usage)
-7. [Schema Design Decisions](#schema-design-decisions)
-8. [Tradeoffs Made](#tradeoffs-made)
-9. [What I'd Improve with More Time](#what-id-improve-with-more-time)
-10. [Bonus Features](#bonus-features-implemented)
+6. [Configuration](#configuration)
+7. [SDK Usage](#sdk-usage)
+8. [Schema Design Decisions](#schema-design-decisions)
+9. [Tradeoffs Made](#tradeoffs-made)
+10. [What I'd Improve with More Time](#what-id-improve-with-more-time)
+11. [Bonus Features](#bonus-features-implemented)
 
 ---
 
@@ -69,7 +70,7 @@ docker compose exec ingestion python -m app.seed
 │  /dashboard   → Live metrics + charts                       │
 │  /logs        → Inference log explorer                      │
 │                                                             │
-│  Calls LLM providers via llm_obs SDK wrappers              │
+│  Calls LLM via llm_obs SDK (stream_chat + auto_instrument)  │
 └──────────────┬──────────────────────────────────────────────┘
                │ POST /v1/ingest/batch (async, fire-and-forget)
                ▼
@@ -77,18 +78,18 @@ docker compose exec ingestion python -m app.seed
 │           ingestion/  (FastAPI :4000)                       │
 │                                                             │
 │  1. Validate payload (Pydantic)                             │
-│  2. Write to inference_events (audit row)                   │
-│  3. Enqueue Celery job → Redis                              │
+│  2. Write to inference_events (audit row, Postgres)         │
+│  3. Enqueue Celery job → Redis DB 1 (broker)                │
 └──────────────┬──────────────────────────────────────────────┘
-               │ Celery job via Redis broker
+               │ Celery worker consumes from Redis DB 1
                ▼
 ┌─────────────────────────────────────────────────────────────┐
 │           Celery Worker                                     │
 │                                                             │
-│  1. PII redact (regex + Luhn)                               │
-│  2. Compute cost_usd from price table                       │
-│  3. UPSERT inference_logs (idempotent by ULID)              │
-│  4. PUBLISH to Redis channel "metrics.events"               │
+│  1. Derive previews + input_hash from payload               │
+│  2. UPSERT inference_logs (idempotent by span id)           │
+│  3. UPDATE inference_events → PROCESSED                     │
+│  4. PUBLISH to Redis DB 0 channel "metrics.events"          │
 └──────────────┬──────────────────────────────────────────────┘
                │ Redis Pub/Sub
                ▼
@@ -96,12 +97,101 @@ docker compose exec ingestion python -m app.seed
 │  GET /v1/stream (SSE)  →  Dashboard live feed               │
 └─────────────────────────────────────────────────────────────┘
 
-LLM Providers:  OpenAI · Anthropic · Google Gemini · Ollama (local)
-Storage:        PostgreSQL 16 (all persistent data)
-Queue/PubSub:   Redis 7
+LLM Providers:  OpenAI · Anthropic · Google Gemini · AWS Bedrock · Ollama · any OpenAI-compatible URL
+Storage:        PostgreSQL 16 (conversations, messages, inference_logs, inference_events)
+Queue:          Redis DB 1 (Celery broker — temporary task messages)
+Pub/Sub:        Redis DB 0 (live dashboard SSE feed)
+PII + cost:     Computed in llm_obs SDK before HTTP ingest and before LLM calls
 ```
 
-For detailed diagrams (sequence, ER, class, flow) see `[ARCHITECTURE.md](./ARCHITECTURE.md)`.
+For detailed diagrams (sequence, ER, class, flow) see [ARCHITECTURE.md](./ARCHITECTURE.md).
+
+---
+
+## Data Flow Cheat Sheet
+
+One chat message, end to end:
+
+```text
+Browser                web/ (:3000)              SDK (llm_obs)           ingestion/ (:4000)       worker              dashboard
+   │                        │                        │                        │                    │                    │
+   │ POST /api/chat (SSE)   │                        │                        │                    │                    │
+   ├───────────────────────►│                        │                        │                    │                    │
+   │                        │ INSERT messages        │                        │                    │                    │
+   │                        │ (raw content, Postgres)│                        │                    │                    │
+   │                        │                        │                        │                    │                    │
+   │                        │ set_obs_context(conv)  │                        │                    │                    │
+   │                        │ stream_chat(...)       │                        │                    │                    │
+   │                        ├───────────────────────►│ sanitize_messages      │                    │                    │
+   │                        │                        │ (PII before LLM)       │                    │                    │
+   │                        │                        │                        │                    │                    │
+   │                        │                        │ auto_instrument span   │                    │                    │
+   │                        │                        │ → LLM provider         │                    │                    │
+   │◄── SSE tokens ─────────┤◄── stream chunks ──────┤                        │                    │                    │
+   │                        │                        │ span: TTFT, usage, out  │                    │                    │
+   │                        │                        │                        │                    │                    │
+   │                        │ INSERT assistant msg   │ span.end()             │                    │                    │
+   │                        │                        │ → compute_cost()       │                    │                    │
+   │                        │                        │ → client.log()         │                    │                    │
+   │                        │                        │   (PII before HTTP)    │                    │                    │
+   │                        │                        │ → BatchTransport queue │                    │                    │
+   │                        │                        │                        │                    │                    │
+   │                        │                        │ POST /v1/ingest/batch  │                    │                    │
+   │                        │                        ├───────────────────────►│ INSERT inference_events (Postgres)
+   │                        │                        │                        │ Celery.delay() → Redis DB 1
+   │                        │                        │◄── 202 Accepted ───────┤                    │
+   │                        │                        │                        │                    │                    │
+   │                        │                        │                        │ consume job        │                    │
+   │                        │                        │                        ├───────────────────►│ UPSERT inference_logs
+   │                        │                        │                        │                    │ UPDATE events→PROCESSED
+   │                        │                        │                        │                    │ PUBLISH metrics.events
+   │                        │                        │                        │                    │ (Redis DB 0)
+   │                        │                        │                        │                    │                    │
+   │                        │ GET /api/dashboard/stream (SSE proxy)            │                    │                    │
+   │◄── live log event ─────┤◄─────────────────────────────────────────────────┤ SUBSCRIBE ─────────┤                    │
+   │                        │                        │                        │                    │                    │
+   │ GET /logs              │ GET /api/dashboard/logs (proxy)                  │                    │                    │
+   ├───────────────────────►├─────────────────────────────────────────────────►│ SELECT inference_logs
+```
+
+### At each step — what gets stored where
+
+| Step | Component | Writes to | Notes |
+| ---- | --------- | --------- | ----- |
+| 1 | `web/routers/chat.py` | `messages`, `conversations` | Raw chat text for multi-turn context |
+| 2 | `guard.sanitize_messages_for_llm` | — (in memory) | PII scrubbed before LLM sees messages |
+| 3 | `InferenceSpan` (auto_instrument) | — (in memory) | Records latency, TTFT, tokens, output |
+| 4 | `span.end()` → `client.log()` | SDK in-memory queue | Adds `cost_usd`, redacts request/response |
+| 5 | `BatchTransport` | — → HTTP | Flushes every 2s or 20 events |
+| 6 | `ingestion/routers/ingest.py` | `inference_events` | Durable copy; status `RECEIVED` |
+| 6 | `process_inference_log.delay()` | Redis DB 1 | Temporary Celery job until consumed |
+| 7 | Celery worker | `inference_logs` | Queryable observability rows |
+| 7 | Celery worker | Redis DB 0 pub/sub | Live dashboard feed |
+| 8 | Dashboard UI | — (reads only) | `/logs` → `inference_logs`; stream → Redis |
+
+### Key IDs
+
+| ID | Generated by | Used for |
+| -- | ------------ | -------- |
+| `conversation_id` | Web (UUID) | Links chat thread ↔ logs via `set_obs_context()` |
+| `InferenceSpan.id` | SDK (`new_id()`) | Primary key in `inference_logs` |
+| `inference_events.id` | Ingestion (UUID) | Internal queue/audit row — not the log id |
+
+### Timing
+
+- **Chat tokens** — real-time (SSE, synchronous with LLM)
+- **Ingest HTTP** — async, batched (≤2s delay typical)
+- **Worker → DB** — async (Celery, usually sub-second after ingest)
+- **Dashboard live feed** — near real-time via Redis pub/sub after worker runs
+
+### If something breaks
+
+| Symptom | Likely cause | Check |
+| ------- | ------------ | ----- |
+| Chat works, no logs in dashboard | Worker not running | `docker compose ps worker` |
+| Logs in `inference_events` stuck at `RECEIVED` | Celery/Redis issue | Redis DB 1, worker logs |
+| Logs missing entirely | Ingest down or SDK transport failed | `INGEST_URL`, ingestion :4000 |
+| Logs exist but no `conversation_id` | `set_obs_context()` not called | `web/app/routers/chat.py` |
 
 ---
 
@@ -112,9 +202,9 @@ For detailed diagrams (sequence, ER, class, flow) see `[ARCHITECTURE.md](./ARCHI
 | ----------- | ---- | ---------------- | ------------------------------------------- |
 | `web`       | 3000 | FastAPI + Jinja2 | Chat UI, dashboard, conversation management |
 | `ingestion` | 4000 | FastAPI          | Receives SDK logs, enqueues Celery jobs     |
-| `worker`    | —    | Celery           | Processes logs: PII redact, cost, DB write  |
+| `worker`    | —    | Celery           | Consumes Redis queue; writes `inference_logs`; publishes live metrics |
 | `postgres`  | 5432 | PostgreSQL 16    | All persistent storage                      |
-| `redis`     | 6379 | Redis 7          | Celery broker + Pub/Sub                     |
+| `redis`     | 6379 | Redis 7          | DB 0: pub/sub · DB 1: Celery broker · DB 2: result backend |
 | `adminer`   | 8080 | Adminer          | DB admin UI                                 |
 
 
@@ -213,15 +303,26 @@ CELERY_RESULT_BACKEND=redis://localhost:6379/2
 INGEST_URL=http://localhost:4000       # web → ingestion URL
 INGEST_API_KEY=dev-key                 # simple auth header
 
-# ── LLM Providers (set at least one) ─────────────────────────
+# ── LLM Endpoints (recommended) ──────────────────────────────
+# Comma-separated URLs — SDK probes each for provider + models
+#   http://localhost:11434
+#   ollama://http://host.docker.internal:11434
+#   http://10.0.1.5:8080|my-api-key
+LLM_ENDPOINTS=
+
+# ── LLM Providers (legacy — used when LLM_ENDPOINTS is empty) ─
 OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
 GOOGLE_API_KEY=
 
-# ── Ollama (local, free, no key needed) ──────────────────────
+# ── Ollama (legacy) ──────────────────────────────────────────
 # Local dev:       http://localhost:11434
 # Docker Compose:  http://host.docker.internal:11434
 OLLAMA_BASE_URL=
+
+# ── Probe fallback ───────────────────────────────────────────
+LLM_DEFAULT_MODEL=          # used when URL probe finds no models
+LLM_PROBE_TIMEOUT=5
 
 # ── App ───────────────────────────────────────────────────────
 ENVIRONMENT=dev
@@ -240,57 +341,60 @@ ollama pull mistral         # ~4GB, strong reasoning
 
 ## SDK Usage
 
-The `llm_obs` SDK wraps your LLM client to auto-capture inference metadata. Zero code changes to your LLM call logic.
+The `llm_obs` SDK auto-captures inference metadata. The web app uses two SDK entry points:
 
-### Auto-instrumentation
+1. **`ObservabilityClient.auto_instrument()`** — patches provider SDKs; creates an `InferenceSpan` per call
+2. **`stream_chat()`** — unified streaming chat; probes URLs from env; redacts PII before the LLM call
+
+### Auto-instrumentation (startup)
 
 ```python
-from llm_obs import ObservabilityClient, wrap_openai
-from openai import OpenAI
+from llm_obs import ObservabilityClient
 
 obs = ObservabilityClient(
     endpoint="http://localhost:4000",
     api_key="dev-key",
-    environment="prod",
+    environment="dev",
+    redact_pii=True,
 )
-
-# Wrap once — every subsequent call is auto-logged
-client = wrap_openai(OpenAI(), obs)
-
-response = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role": "user", "content": "Explain LLMs in one sentence."}],
-)
+obs.auto_instrument()   # patches openai / anthropic / gemini / bedrock
 ```
 
-The SDK captures: model, provider, latency, TTFT, token usage, cost, timestamps, status, errors, request/response previews, conversation ID.
-
-### Streaming
+### Streaming chat (web handler)
 
 ```python
-stream = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role": "user", "content": "Tell me a story."}],
-    stream=True,
-)
-# Streaming is auto-instrumented — TTFT is measured on first chunk
-for chunk in stream:
-    print(chunk.choices[0].delta.content or "", end="")
+from llm_obs import stream_chat, set_obs_context
+
+set_obs_context(conversation_id=str(conv.id))   # links logs to conversation
+
+async for chunk in stream_chat(
+    provider="ollama",
+    model="gemma3:4b",
+    messages=[{"role": "user", "content": "Hello"}],
+):
+    print(chunk, end="")
 ```
 
-### Anthropic & Gemini
+### URL and model discovery
 
 ```python
-from llm_obs import wrap_anthropic, wrap_gemini
-from anthropic import Anthropic
-import google.generativeai as genai
+from llm_obs import available_providers
 
-# Anthropic
-anthropic_client = wrap_anthropic(Anthropic(), obs)
+# Reads LLM_ENDPOINTS / OLLAMA_BASE_URL / API keys from env
+# Ollama:     GET /api/tags  → model names
+# vLLM etc.:  GET /v1/models → model ids
+providers = available_providers()
+# → {"ollama": ["gemma3:4b", "llama3.2"]}
+```
 
-# Gemini
-genai.configure(api_key="...")
-gemini_model = wrap_gemini(genai.GenerativeModel("gemini-1.5-flash"), obs)
+### What happens on each LLM call
+
+```
+patched provider call
+  → InferenceSpan.start (captures request, conversation_id from contextvars)
+  → stream tokens → span.set_ttft(), span.append_output(), span.set_usage()
+  → span.end() → builds payload, compute_cost(), ObservabilityClient.log()
+  → PII redact in SDK → BatchTransport → POST /v1/ingest/batch
 ```
 
 ### Manual span (custom instrumentation)
@@ -302,12 +406,9 @@ span = obs.start_span(
     request={"messages": [{"role": "user", "content": "Hello"}]},
     conversation_id="conv-123",
 )
-
-# ... do your LLM call manually ...
-
 span.set_ttft(ms=210)
 span.set_usage(prompt_tokens=42, completion_tokens=11)
-span.end(status="success", finish_reason="stop", streamed=True)
+span.end(status="success", streamed=True)
 ```
 
 ---
@@ -320,22 +421,22 @@ Tracks chat sessions. Soft-delete via `status=ARCHIVED` keeps history intact wit
 
 ### `messages`
 
-Two content columns: `content` (raw, used for LLM context window) and `content_redacted` (PII-scrubbed, used in dashboards). This allows accurate multi-turn conversations while keeping the observability layer privacy-safe. Setting `STORE_RAW_MESSAGES=false` can disable raw storage for stricter environments.
+Stores chat history for multi-turn context. Single `content` column (raw text). PII is **not** duplicated here — privacy for observability is handled in `inference_logs` (SDK redacts before ingest) and before LLM calls (`sanitize_messages_for_llm` in `stream_chat`).
 
 ### `inference_logs`
 
 The core table — one row per LLM call. Key design choices:
 
-- **SDK-generated ULID as primary key** — allows the worker's `ON CONFLICT DO UPDATE` upsert to be idempotent, making Celery retries completely safe
-- `**request_payload` + `response_payload` as JSONB** — schema-free, handles evolving LLM API response shapes without migrations
-- `**input_preview` / `output_preview`** (256 chars, PII-redacted) — fast dashboard display without loading full payloads
-- `**input_hash**` (sha256 of request) — enables duplicate detection and caching analysis
-- `**ttft_ms**` (time-to-first-token) — critical for streaming UX quality measurement, stored separately from total `latency_ms`
-- `**cost_usd**` computed in the worker — keeps the hot path lean; price table is easily updated
+- **SDK-generated id as primary key** — allows the worker's `ON CONFLICT DO UPDATE` upsert to be idempotent, making Celery retries safe
+- **`request_payload` + `response_payload` as JSONB** — PII-redacted in the SDK before HTTP ingest
+- **`input_preview` / `output_preview`** (256 chars) — derived by worker for fast dashboard display
+- **`ttft_ms`** (time-to-first-token) — measured by `InferenceSpan` on first streaming chunk
+- **`cost_usd`** — computed in the SDK (`span.end()` → `compute_cost()`), stored by worker as-is
+- **`pii_detections`** — attached by SDK during `ObservabilityClient.log()`
 
 ### `inference_events`
 
-Audit/replay buffer. Every raw SDK payload is written here *before* the Celery job runs. If the worker has a bug and corrupts data, you can:
+Durable audit/replay buffer in **Postgres**. Every payload is written here *before* the Celery job runs. The Celery job itself lives temporarily in **Redis DB 1** until a worker consumes it.
 
 ```sql
 UPDATE inference_events SET status = 'RECEIVED', error = NULL
@@ -359,11 +460,11 @@ Pre-aggregated 1-minute buckets keyed by `(bucket, provider, model)`. Dashboard 
 | **Queue**              | Celery + Redis                             | Kafka, RabbitMQ                    | Celery is operationally trivial; Redis already present; sufficient for POC throughput |
 | **Analytics DB**       | PostgreSQL only                            | ClickHouse, TimescaleDB            | JSONB + percentile functions handle POC volume; avoids another infra dependency       |
 | **Streaming protocol** | SSE (Server-Sent Events)                   | WebSockets                         | SSE is unidirectional, works behind every HTTP proxy, simpler to implement            |
-| **PII detection**      | Custom regex + Luhn                        | Microsoft Presidio, AWS Comprehend | Zero external services; deterministic; no data leaves the system; fast                |
+| **PII detection**      | Custom regex + Luhn in SDK                 | Microsoft Presidio, AWS Comprehend | Redact before LLM call and before HTTP ingest; deterministic, no external service   |
 | **UI framework**       | Jinja2 + Tailwind CDN                      | React/Next.js                      | Python-only project; no Node.js or build pipeline needed                              |
-| **Idempotency**        | ULID primary key + `ON CONFLICT DO UPDATE` | Deduplication table                | Simpler; ULID is already unique per call; safe for unlimited retries                  |
+| **Idempotency**        | SDK id + `ON CONFLICT DO UPDATE`           | Deduplication table                | Unique per call; safe for unlimited Celery retries                                    |
 | **Multi-turn context** | Last 20 messages from DB                   | Full history / vector search       | Keeps prompt size predictable; avoids context overflow for POC                        |
-| **Cost computation**   | Hardcoded price table in worker            | External pricing API               | Eliminates a network dependency; easily updated; transparent                          |
+| **Cost computation**   | SDK `compute_cost()` in `span.end()`       | External pricing API               | Cost ships with payload; worker is a simple writer                                    |
 | **Local LLMs**         | Ollama (OpenAI-compatible `/v1`)           | llama.cpp directly                 | Reuses existing OpenAI client code; Ollama manages model downloads and GPU            |
 
 
@@ -373,7 +474,7 @@ Pre-aggregated 1-minute buckets keyed by `(bucket, provider, model)`. Dashboard 
 
 **Infrastructure & Reliability**
 
-1. **Committed Alembic migrations** — auto-generate the initial migration file so schema is versioned and reproducible across environments
+1. **Committed Alembic migrations** — expand versioned migration history as schema evolves
 2. **Celery Beat rollup job** — periodic task every 60s to materialize `metric_rollups` instead of live aggregation, making 7d+ queries instant
 3. **Kafka instead of Redis queue** — persistent message log enables true replay without the `inference_events` workaround
 
@@ -401,7 +502,8 @@ Pre-aggregated 1-minute buckets keyed by `(bucket, provider, model)`. Dashboard 
 | ✅ Live dashboard                          | Redis Pub/Sub → SSE → Chart.js charts auto-update as logs arrive         |
 | ✅ Latency / Throughput / Error dashboards | p50/p95/p99 latency, requests over time, error breakdown by type         |
 | ✅ Event-based architecture                | Celery + Redis fully decouples ingestion from log processing             |
-| ✅ PII redaction                           | Regex + Luhn validation; runs in worker; `pii_detections` stored per log |
+| ✅ PII redaction                           | SDK: before LLM (`guard.py`) + before ingest (`client.log()`); `pii_detections` on each log |
+| ✅ URL-based provider discovery            | `discovery.py` probes Ollama `/api/tags`, OpenAI-compat `/v1/models`, Bedrock API |
 | ✅ Docker Compose one-command              | `docker compose up --build` starts all 6 services                        |
 | ✅ Cancel a conversation                   | `asyncio.Event` registry; cancel button stops LLM stream mid-response    |
 | ✅ List conversations                      | Sidebar with all active conversations, sorted by last activity           |

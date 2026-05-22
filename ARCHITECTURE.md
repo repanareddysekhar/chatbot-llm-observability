@@ -28,9 +28,12 @@ graph TB
     end
 
     subgraph SDK["sdk/ — llm_obs Python package"]
-        ObsClient["ObservabilityClient\n(batching + retry)"]
+        ObsClient["ObservabilityClient\nauto_instrument()"]
+        Span["InferenceSpan\nper LLM call"]
+        Guard["guard.py\nPII before LLM call"]
         Transport["BatchTransport\n(flush every 2s or 20 events)"]
-        PII["llm_obs.pii\n(PII redaction)"]
+        Discovery["discovery.py\nURL probe + model list"]
+        PII["llm_obs.pii\nPII before HTTP ingest"]
     end
 
     subgraph Ingestion["ingestion/ — FastAPI :4000"]
@@ -38,16 +41,16 @@ graph TB
         MetricsAPI["GET /v1/metrics/summary\nGET /v1/metrics/timeseries"]
         LogsAPI["GET /v1/logs\nGET /v1/logs/:id"]
         StreamAPI["GET /v1/stream (SSE)"]
-        EventTable[("inference_events\naudit table")]
+        EventTable[("inference_events\nPostgres audit buffer")]
     end
 
     subgraph Worker["Celery Worker"]
-        Processor["ingest.processor\n1. PII redact\n2. Compute cost\n3. Upsert inference_logs\n4. Publish to Redis"]
+        Processor["process_inference_log\n1. Derive previews\n2. Upsert inference_logs\n3. Publish to Redis"]
     end
 
     subgraph Storage["Infrastructure"]
-        Postgres[("PostgreSQL 16\nconversations\nmessages\ninference_logs\nmetric_rollups")]
-        Redis[("Redis 7\nCelery queue\nPub/Sub channel")]
+        Postgres[("PostgreSQL 16\nconversations · messages\ninference_logs · inference_events")]
+        Redis[("Redis 7\nDB1: Celery queue\nDB0: Pub/Sub")]
     end
 
     User -->|"HTTP + SSE"| ChatUI
@@ -57,16 +60,18 @@ graph TB
     DashProxy -->|"proxy"| MetricsAPI
     DashProxy -->|"SSE proxy"| StreamAPI
 
-    ChatAPI -->|"stream tokens"| LLM
+    ChatAPI -->|"stream_chat()"| LLM
     ChatAPI --> CancelReg
-    ChatAPI -->|"log(payload)"| ObsClient
+    ChatAPI -->|"set_obs_context()"| ObsClient
+    ObsClient --> Span
+    Span -->|"end() → log()"| ObsClient
+    ObsClient -->|"redact payload"| PII
     ObsClient --> Transport
     Transport -->|"POST /v1/ingest/batch"| IngestAPI
 
     IngestAPI --> EventTable
-    IngestAPI -->|"enqueue job"| Redis
-    Redis -->|"consume"| Processor
-    Processor -->|"llm_obs.pii.redact_deep()"| PII
+    IngestAPI -->|"process_inference_log.delay()"| Redis
+    Redis -->|"worker consumes"| Processor
     Processor -->|"upsert"| Postgres
     Processor -->|"PUBLISH metrics.events"| Redis
 
@@ -109,16 +114,22 @@ llm-observability/
 ├── sdk/                        # Python package: llm_obs
 │   ├── pyproject.toml
 │   └── llm_obs/
-│       ├── client.py           # ObservabilityClient
+│       ├── client.py           # ObservabilityClient + auto_instrument()
 │       ├── span.py             # InferenceSpan (per-call lifecycle)
+│       ├── context.py          # set_obs_context() — contextvars for conversation_id
+│       ├── guard.py            # sanitize_messages_for_llm() — PII before LLM
+│       ├── discovery.py        # URL probe, model detection, LLM_ENDPOINTS parsing
+│       ├── streaming.py        # stream_chat() — unified multi-provider streaming
 │       ├── transport.py        # BatchTransport (buffer → flush → POST)
-│       ├── id.py               # ULID generation
+│       ├── id.py               # unique id generation
 │       ├── providers/
-│       │   ├── openai.py       # wrap_openai()
-│       │   ├── anthropic.py    # wrap_anthropic()
-│       │   └── gemini.py       # wrap_gemini()
+│       │   ├── interceptor.py  # install_provider_interceptors()
+│       │   ├── openai.py       # patches AsyncCompletions.create
+│       │   ├── anthropic.py    # patches AsyncMessages.create
+│       │   ├── gemini.py       # patches generate_content_async
+│       │   └── bedrock.py      # patches bedrock-runtime invoke
 │       └── pii/
-│           ├── patterns.py     # Regex catalog (email, phone, SSN, CC, IP, API keys)
+│           ├── patterns.py     # Regex catalog
 │           ├── luhn.py         # Credit card Luhn validation
 │           └── redact.py       # redact() + redact_deep()
 │
@@ -127,7 +138,8 @@ llm-observability/
 │   ├── Dockerfile
 │   ├── entrypoint.sh           # Runs Alembic migrations then starts server
 │   ├── alembic/
-│   │   └── env.py
+│   │   ├── env.py
+│   │   └── versions/           # e.g. drop messages.content_redacted
 │   └── app/
 │       ├── main.py             # FastAPI app, routers registered
 │       ├── config.py           # Pydantic settings (env vars)
@@ -153,10 +165,9 @@ llm-observability/
 │       ├── database.py         # Async SQLAlchemy (reads conversations/messages)
 │       ├── models.py           # Conversation + Message ORM models
 │       ├── cancel_registry.py  # In-memory {inference_log_id → asyncio.Event}
-│       ├── llm/
-│       │   └── factory.py      # stream_chat() + get_provider_client() + Ollama discovery
+│       ├── messages.py         # build_llm_messages(), new_user_message(), etc.
 │       ├── routers/
-│       │   ├── chat.py         # POST /api/chat (SSE), GET /api/chat-stream
+│       │   ├── chat.py         # POST /api/chat (SSE) — uses llm_obs.stream_chat
 │       │   ├── conversations.py# CRUD /api/conversations
 │       │   └── dashboard.py    # Proxy /api/dashboard/* → ingestion
 │       └── templates/
@@ -186,36 +197,38 @@ sequenceDiagram
     participant Worker as Celery Worker
     participant DB as PostgreSQL
 
-    Browser->>Web: GET /api/chat-stream?message=Hi&provider=ollama
+    Browser->>Web: POST /api/chat (SSE)
     Web->>DB: load conversation + message history
-    Web->>DB: INSERT user message
+    Web->>DB: INSERT user message (raw content)
+    Web->>Web: set_obs_context(conversation_id)
     Web-->>Browser: SSE event: meta {conversation_id, inference_log_id}
 
-    Web->>LLM: streaming chat request (with AbortSignal)
+    Web->>Web: stream_chat(provider, model, messages)
+    Note over Web: sanitize_messages_for_llm() — PII scrubbed before LLM
+    Web->>LLM: OpenAI-compatible / provider SDK call (auto_instrumented)
     loop streaming tokens
         LLM-->>Web: token chunk
         Web-->>Browser: SSE event: token {delta}
-        Web->>SDK: span.append_output(chunk)
+        Note over Web,SDK: InferenceSpan records TTFT, output, usage
     end
 
     LLM-->>Web: stream done
     Web->>DB: INSERT assistant message
-    Web->>SDK: span.end(status="success")
+    Note over SDK: span.end() → compute_cost() → client.log()
 
+    SDK->>SDK: PII redact payload (client.log)
     SDK->>SDK: buffer payload (BatchTransport)
-    SDK->>Ingest: POST /v1/ingest/batch (async, background)
+    SDK->>Ingest: POST /v1/ingest/batch (async, background thread)
 
-    Ingest->>DB: INSERT inference_events (audit row)
-    Ingest->>Redis: LPUSH inference_logs queue (Celery job)
+    Ingest->>DB: INSERT inference_events (Postgres, status=RECEIVED)
+    Ingest->>Redis: process_inference_log.delay() → Redis DB 1 queue
     Ingest-->>SDK: 202 Accepted
 
-    Worker->>Redis: BRPOP (consume job)
-    Worker->>Worker: PII redact request + response payloads
-    Worker->>Worker: compute cost_usd from price table
-    Worker->>Worker: generate input/output previews + sha256 hash
-    Worker->>DB: UPSERT inference_logs (idempotent by id)
+    Worker->>Redis: consume Celery job from DB 1
+    Worker->>Worker: derive input_preview, output_preview
+    Worker->>DB: UPSERT inference_logs (idempotent by span id)
     Worker->>DB: UPDATE inference_events status=PROCESSED
-    Worker->>Redis: PUBLISH metrics.events {lean log row}
+    Worker->>Redis: PUBLISH metrics.events (DB 0)
 
     Redis-->>Ingest: metrics.events message
     Ingest-->>Browser: SSE event: log (live dashboard feed)
@@ -242,15 +255,14 @@ erDiagram
         uuid id PK
         uuid conversation_id FK
         enum role "USER|ASSISTANT|SYSTEM"
-        text content "raw (for LLM context)"
-        text content_redacted "PII-scrubbed (for display)"
+        text content "raw — used for multi-turn LLM context"
         int tokens
-        uuid inference_log_id FK
+        uuid inference_log_id
         timestamptz created_at
     }
 
     inference_logs {
-        string id PK "ULID — SDK-generated"
+        string id PK "SDK span id"
         uuid conversation_id FK
         enum provider
         string model
@@ -259,16 +271,16 @@ erDiagram
         int prompt_tokens
         int completion_tokens
         int total_tokens
-        decimal cost_usd
+        decimal cost_usd "computed in SDK span.end()"
         int latency_ms
         int ttft_ms "time-to-first-token"
         bool streamed
-        text input_preview "first 256 chars, redacted"
-        text output_preview "first 256 chars, redacted"
-        string input_hash "sha256 of request"
-        jsonb request_payload "full request, redacted"
-        jsonb response_payload "full response, redacted"
-        jsonb pii_detections "[{type, count}]"
+        text input_preview "first 256 chars — derived by worker"
+        text output_preview "first 256 chars — derived by worker"
+        jsonb request_payload "PII-redacted in SDK before ingest"
+        jsonb response_payload "PII-redacted in SDK before ingest"
+        jsonb pii_detections "[{type, count}] — from SDK"
+        string sdk_version
         string environment
         timestamptz started_at
         timestamptz ended_at
@@ -277,7 +289,7 @@ erDiagram
 
     inference_events {
         uuid id PK
-        jsonb payload "raw SDK payload"
+        jsonb payload "full SDK payload at receive time"
         enum status "RECEIVED|PROCESSED|FAILED"
         timestamptz received_at
         timestamptz processed_at
@@ -307,12 +319,13 @@ erDiagram
 
 | Decision | Rationale |
 |---|---|
-| `inference_logs.id` is SDK-generated ULID | Allows idempotent upsert — Celery retries are safe |
-| `messages.content` vs `content_redacted` | Raw content needed for LLM context window; redacted version used in dashboard |
-| `inference_events` audit table | Stores raw payload before processing — enables replay if worker had a bug |
-| `request_payload`/`response_payload` as JSONB | Schema-free, queryable, good for evolving LLM APIs |
-| `metric_rollups` pre-aggregated | Dashboard time-series queries over 7d+ would be slow on `inference_logs` alone |
-| ULID over UUID for log IDs | ULIDs are time-sortable and URL-safe |
+| `inference_logs.id` is SDK span id | Allows idempotent upsert — Celery retries are safe |
+| `messages.content` only (no redacted column) | Raw history for LLM context; privacy lives in `inference_logs` + SDK redaction before LLM |
+| `inference_events` in Postgres + Celery queue in Redis DB 1 | Postgres = durable payload buffer; Redis = temporary work queue |
+| PII redaction in SDK, not worker | Scrub before data leaves the web process; worker is a simple writer |
+| `cost_usd` computed in `span.end()` | Price table lives in SDK; worker stores pre-computed value |
+| `request_payload`/`response_payload` as JSONB | Schema-free, queryable, handles evolving LLM APIs |
+| `metric_rollups` pre-aggregated | Dashboard time-series over 7d+ would be slow on `inference_logs` alone |
 
 ---
 
@@ -324,6 +337,8 @@ classDiagram
         +endpoint: str
         +api_key: str
         +environment: str
+        +redact_pii: bool
+        +auto_instrument() ObservabilityClient
         +start_span(provider, model, request, conversation_id) InferenceSpan
         +log(payload: dict) void
         +flush() void
@@ -332,7 +347,7 @@ classDiagram
     }
 
     class InferenceSpan {
-        +id: str  ← ULID
+        +id: str
         +provider: str
         +model: str
         +conversation_id: str
@@ -364,21 +379,21 @@ classDiagram
     InferenceSpan --> ObservabilityClient : calls log()
 ```
 
-### Provider Wrapping Strategy
+### Provider instrumentation strategy
 
-Each provider wrapper (`wrap_openai`, `wrap_anthropic`, `wrap_gemini`, Ollama via `wrap_openai`) monkey-patches the client's create method:
+`auto_instrument()` patches provider SDK methods at class level via `providers/interceptor.py`:
 
 ```mermaid
 flowchart LR
-    A["call openai.chat.completions.create()"] --> B["instrumented_create()"]
-    B --> C["span = obs.start_span(...)"]
+    A["stream_chat() or direct SDK call"] --> B["patched create()"]
+    B --> C["span = obs.start_span(...)\nconversation_id from contextvars"]
     C --> D["call original_create()"]
     D --> E{streamed?}
-    E -->|yes| F["wrap generator\n→ set_ttft on first token\n→ append_output per chunk\n→ span.end() on finish"]
+    E -->|yes| F["_InstrumentedAsyncStream\n→ set_ttft on first token\n→ append_output per chunk\n→ span.end() on finish"]
     E -->|no| G["set_usage()\nappend_output()\nspan.end()"]
     F --> H["yield chunks to caller"]
     G --> I["return response to caller"]
-    F --> J["SDK batches + ships log"]
+    F --> J["span.end() → client.log() → BatchTransport"]
     G --> J
 ```
 
@@ -397,19 +412,22 @@ flowchart TD
     end
 
     subgraph RedisQ["Redis :6379"]
-        CeleryQ["DB 1: Celery queue\n'inference_logs'"]
-        PubSub["Pub/Sub channel\n'metrics.events'"]
+        CeleryQ["DB 1: Celery broker\n(temporary task messages)"]
+        PubSub["DB 0: Pub/Sub channel\n'metrics.events'"]
+    end
+
+    subgraph PostgresBuf["PostgreSQL"]
+        EventBuf["inference_events\n(durable payload buffer)"]
+        LogTable["inference_logs\n(final queryable rows)"]
     end
 
     subgraph CeleryWorker["Celery Worker (4 concurrency)"]
-        Fetch["fetch job from queue"]
-        PiiRedact["redact_deep(request_payload)\nredact_deep(response_payload)"]
-        CostCalc["compute cost_usd\nfrom PRICE_TABLE"]
-        Derived["input_preview, output_preview\ninput_hash = sha256(request)"]
+        Fetch["consume job from Redis DB 1"]
+        Derived["input_preview, output_preview\nfrom payload fields"]
         Upsert["UPSERT inference_logs\n(ON CONFLICT DO UPDATE)"]
         UpdateEvent["UPDATE inference_events\nstatus=PROCESSED"]
-        Publish["PUBLISH metrics.events\nlean JSON row"]
-        Retry["retry with\nexponential backoff\nmax 5 attempts"]
+        Publish["PUBLISH metrics.events"]
+        Retry["retry with exponential backoff\nmax 5 attempts"]
     end
 
     subgraph Dashboard["Live Dashboard"]
@@ -417,12 +435,14 @@ flowchart TD
         Browser["Browser EventSource"]
     end
 
-    SDK -->|"POST /v1/ingest/batch"| Route
+    SDK -->|"POST /v1/ingest/batch\n(PII already redacted)"| Route
     Route --> AuditWrite
+    AuditWrite --> EventBuf
     Route --> Enqueue
     Enqueue --> CeleryQ
     CeleryQ --> Fetch
-    Fetch --> PiiRedact --> CostCalc --> Derived --> Upsert
+    Fetch --> Derived --> Upsert
+    Upsert --> LogTable
     Upsert --> UpdateEvent
     UpdateEvent --> Publish
     Publish --> PubSub
@@ -435,35 +455,43 @@ flowchart TD
 
 **Why event-driven?**
 - The hot path (chat streaming) never waits for DB writes
-- PII redaction and cost computation happen off the critical path
-- `inference_events` table acts as a replay buffer — if the worker had a bug, reset `status=RECEIVED` and re-enqueue
+- Worker is a lightweight writer — PII and cost already done in SDK
+- `inference_events` (Postgres) + Redis Celery queue = durable buffer + async dispatch
 - Celery retries handle transient failures transparently
 
 ---
 
 ## 8. PII Redaction Pipeline
 
+PII is redacted in **two SDK choke points** — never in the Celery worker.
+
 ```mermaid
-flowchart LR
-    Input["Raw LLM payload\n{request, response}"]
-    
-    subgraph redact_deep["llm_obs.pii.redact_deep()"]
-        Walk["Walk all string leaves\nin nested dict/list"]
-        Patterns["Apply regex patterns:\n• email\n• phone (E.164 + US)\n• SSN (xxx-xx-xxxx)\n• credit card + Luhn check\n• IPv4\n• API keys (sk-, sk-ant-, AKIA...)\n• URL query secrets"]
-        Replace["Replace matches with\n[REDACTED_EMAIL] etc."]
-        Count["Count detections\nper type"]
+flowchart TD
+    subgraph BeforeLLM["Before LLM call — guard.py"]
+        M1["stream_chat(messages)"]
+        M2["sanitize_messages_for_llm()"]
+        M3["Provider receives redacted messages"]
+        M1 --> M2 --> M3
     end
 
-    Output["Redacted payload\n+ pii_detections: [{type, count}]"]
+    subgraph BeforeIngest["Before HTTP ingest — client.py"]
+        P1["span.end() builds payload"]
+        P2["ObservabilityClient.log()"]
+        P3["redact_deep(request + response)"]
+        P4["BatchTransport → POST /v1/ingest/batch"]
+        P1 --> P2 --> P3 --> P4
+    end
 
-    Input --> Walk --> Patterns --> Replace --> Count --> Output
+    LLM["LLM Provider"] --> BeforeIngest
+    BeforeLLM --> LLM
 ```
 
+**Detectors** (in `llm_obs.pii`): email, phone, SSN, credit card (Luhn), IPv4, API keys, URL query secrets.
+
 **Design choices:**
-- Regex-only (no external NLP service) — deterministic, zero latency, no data leaves the system
-- Luhn algorithm validates credit card numbers before redacting — reduces false positives on long digit strings
-- `redact_deep()` walks arbitrary nested JSON — handles both flat strings and deeply nested message arrays
-- Worker is the canonical redactor; SDK-side redaction is opt-in (useful when ingestion is across a network boundary)
+- Regex-only — deterministic, zero latency, no external NLP service
+- Worker stores payloads as received (already redacted by SDK)
+- `inference_events.payload` may contain pre-redacted data from SDK at receive time
 
 ---
 
@@ -501,23 +529,42 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    Factory["llm/factory.py\nstream_chat(provider, model, messages)"]
-    
-    Factory -->|"provider=openai"| OpenAI["_openai_stream()\nAsyncOpenAI client\nstream_options include_usage=True"]
-    Factory -->|"provider=anthropic"| Anthropic["_anthropic_stream()\nAsyncAnthropic client\nmessages.stream() context manager"]
-    Factory -->|"provider=google"| Gemini["_gemini_stream()\ngoogle.generativeai\nasyncio.to_thread wrapper"]
-    Factory -->|"provider=ollama"| Ollama["_ollama_stream()\nAsyncOpenAI(base_url=OLLAMA_BASE_URL)\napi_key='ollama' (dummy)"]
+    Env["LLM_ENDPOINTS / API keys / OLLAMA_BASE_URL"]
+    Discover["discovery.py\ndetect_provider() + HTTP probe"]
+    Cache["_discovered_cache\n(list of DiscoveredProvider)"]
+    Stream["streaming.py\nstream_chat(provider, model, messages)"]
 
-    OpenAI --> Unified["Unified async generator\nyields str chunks\nfires _send_log() on complete"]
-    Anthropic --> Unified
-    Gemini --> Unified
-    Ollama --> Unified
+    Env --> Discover --> Cache
+    Stream --> Lookup["_find_endpoint(provider key)"]
+    Cache --> Lookup
 
-    Unified --> SDK["llm_obs SDK\nlogs inference metadata"]
-    Unified --> Browser["SSE token events\nto browser"]
+    Lookup -->|"openai / ollama / openai_compatible"| OpenAI["_openai_compat_stream()\nAsyncOpenAI → /v1/chat/completions"]
+    Lookup -->|"anthropic"| Anthropic["_anthropic_stream()"]
+    Lookup -->|"google"| Gemini["_gemini_stream()"]
+    Lookup -->|"bedrock"| Bedrock["_bedrock_stream()"]
+
+    OpenAI --> AutoInst["auto_instrument patches\n→ InferenceSpan per call"]
+    Anthropic --> AutoInst
+    Gemini --> AutoInst
+    Bedrock --> AutoInst
+
+    OpenAI --> Browser["SSE tokens to browser"]
+    Anthropic --> Browser
+    Gemini --> Browser
+    Bedrock --> Browser
 ```
 
-**Ollama specifics:** Ollama's `/v1` endpoint is OpenAI-API-compatible, so it reuses the exact same `AsyncOpenAI` client — only `base_url` differs. No API key required. Models are auto-discovered at runtime via `GET /api/tags`.
+### URL probing (`discovery.py`)
+
+| Server type | Probe | Models from |
+|---|---|---|
+| Ollama | `GET {url}/api/tags` | `models[].name` |
+| OpenAI-compatible (vLLM, LiteLLM, etc.) | `GET {url}/v1/models` | `data[].id` |
+| Bedrock | `bedrock.list_foundation_models()` | `modelId` |
+| OpenAI / Anthropic / Google | Known URL patterns | Static default list |
+| Unknown / probe fails | Fallback | `LLM_DEFAULT_MODEL` or `"default"` |
+
+**Ollama call path:** detected via `/api/tags`, called via OpenAI-compatible `/v1/chat/completions` (same as vLLM).
 
 ---
 
@@ -549,7 +596,7 @@ flowchart LR
 | Worker throughput | 1 Celery worker, 4 concurrent | Add more worker containers (stateless, easy) |
 | DB analytics | Live aggregation on `inference_logs` | Pre-aggregate to `metric_rollups`; consider ClickHouse |
 | Queue durability | Redis (in-memory) | Replace with Kafka or RabbitMQ for persistence |
-| Idempotency | ULID primary key + `ON CONFLICT DO UPDATE` | Already safe at scale |
+| Idempotency | SDK span id + `ON CONFLICT DO UPDATE` | Already safe at scale |
 | PII | Per-message regex | Add NER (`spaCy`) for named entity detection |
 
 ---
@@ -562,7 +609,7 @@ flowchart LR
 | Ingestion API down | SDK `BatchTransport` retries with exponential backoff (250ms → 4s, 3 attempts) |
 | Celery task crashes | Auto-retry up to 5× with exponential backoff; `inference_events.status=FAILED` after all retries |
 | Worker had a bug (bad batch) | Reset `inference_events.status='RECEIVED'` → re-enqueue manually |
-| Redis down | Celery queue unavailable; ingestion API returns 202 but job is lost — mitigated by `inference_events` audit row |
+| Redis queue | In-memory Celery broker (DB 1) — job lost if Redis flushed before worker runs | Mitigated by `inference_events` in Postgres; replace with Kafka for durability |
 | Postgres down | Both services fail fast; `inference_events` acts as buffer when recovered |
 | Duplicate ingest | `ON CONFLICT (id) DO UPDATE` in worker — safe to ingest same event multiple times |
 
@@ -608,40 +655,51 @@ flowchart LR
 
 ## 14. Ingestion Flow
 
-Every LLM call goes through a two-stage pipeline: **capture → async process**.
+Every LLM call goes through: **SDK capture → HTTP ingest → Celery worker → Postgres**.
 
 ```
-LLM Call
+LLM Call (auto_instrumented)
    │
    ▼
-llm_obs SDK  (runs inside web service)
-   │  Wraps openai / anthropic / google-generativeai clients via monkey-patching
-   │  Captures: model, provider, latency, TTFT, tokens, status, request/response
-   │  Buffers payloads in memory (flush every 20 events or every 2s)
+InferenceSpan
+   │  Records: latency, TTFT, tokens, output chunks, errors
+   │  span.end() → compute_cost() → builds JSON payload
    │
-   ▼  POST /v1/ingest/batch  (fire-and-forget, retries up to 3×)
+   ▼
+ObservabilityClient.log()
+   │  PII redact request + response (redact_deep)
+   │  Add environment, sdk_version, pii_detections
+   │
+   ▼
+BatchTransport (in-memory buffer in web process)
+   │  Flush every 20 events OR every 2s (background thread)
+   │
+   ▼  POST /v1/ingest/batch  (retries up to 3×, fire-and-forget)
    │
 ingestion/ FastAPI  (:4000)
    │  1. Validate payload with Pydantic
-   │  2. Write raw event to inference_events (audit row)
-   │  3. Enqueue Celery job → Redis broker
-   │  → returns 202 Accepted immediately (chat streaming is never blocked)
+   │  2. INSERT inference_events (Postgres, status=RECEIVED)
+   │  3. process_inference_log.delay() → Redis DB 1 (Celery broker)
+   │  → returns 202 Accepted (chat streaming never blocked)
    │
-   ▼  Celery job (async, off the hot path)
+   ▼  Celery worker consumes from Redis DB 1
    │
 Worker
-   │  1. PII redact — request + response payloads via regex + Luhn
-   │  2. Compute cost_usd from provider price table
-   │  3. Derive input_preview, output_preview (256 chars), input_hash (sha256)
-   │  4. UPSERT inference_logs (idempotent — ULID primary key)
-   │  5. UPDATE inference_events → status = PROCESSED
-   │  6. PUBLISH lean row to Redis channel "metrics.events"
+   │  1. Derive input_preview, output_preview (256 chars)
+   │  2. UPSERT inference_logs (idempotent — span id primary key)
+   │  3. UPDATE inference_events → status = PROCESSED
+   │  4. PUBLISH lean row to Redis DB 0 channel "metrics.events"
    │
    ▼
-Dashboard SSE consumers pick up the Redis pub/sub message → live feed updates
+Dashboard SSE consumers → live feed updates
+GET /v1/logs → reads inference_logs from Postgres
 ```
 
-**Why two stages?** The chat streaming hot path never waits for DB writes. The worker handles heavy work (PII, cost, hashing) asynchronously. The `inference_events` table is a replay buffer — if the worker had a bug, reset `status='RECEIVED'` and re-enqueue.
+**Temporary storage:**
+- **Redis DB 1** — Celery task messages (until worker consumes)
+- **inference_events (Postgres)** — durable payload copy until processed
+
+**Why two stages?** Chat never waits for DB writes. Worker is a simple async writer. Postgres audit table enables replay if processing fails.
 
 ---
 
@@ -655,24 +713,25 @@ Dashboard SSE consumers pick up the Redis pub/sub message → live feed updates
 | `latency_ms` | Total wall-clock time |
 | `ttft_ms` | Time-to-first-token (streaming calls only) |
 | `prompt_tokens` / `completion_tokens` | Token usage from provider |
-| `cost_usd` | Computed from hardcoded price table |
+| `cost_usd` | Computed in SDK `span.end()` via `metrics/cost.py` |
 | `status` | `SUCCESS`, `ERROR`, `CANCELLED`, `TIMEOUT` |
 | `error_type` | e.g. `rate_limit`, `context_length` |
-| `input_preview` / `output_preview` | First 256 chars, PII-redacted |
-| `request_payload` / `response_payload` | Full JSONB, PII-redacted |
-| `pii_detections` | `[{type: "email", count: 2}]` per log |
+| `input_preview` / `output_preview` | First 256 chars — derived by worker from payload |
+| `request_payload` / `response_payload` | Full JSONB — PII-redacted in SDK before ingest |
+| `pii_detections` | `[{type: "email", count: 2}]` — attached by SDK in `client.log()` |
+| `conversation_id` | From `set_obs_context()` via contextvars |
 
 ### Non-intrusive by design
 
-The SDK monkey-patches the LLM client's `create` method once at startup. Application code calls the LLM exactly as before; the SDK intercepts transparently, measures, and ships the log via a background thread. Any SDK failure (network error, crash) is caught and swallowed — **it never breaks the LLM call itself**.
+`ObservabilityClient.auto_instrument()` patches provider SDK `create` methods once at startup. Application code calls `stream_chat()` or provider SDKs as normal; `InferenceSpan` intercepts transparently. SDK transport failures are retried then dropped — **logging never breaks the LLM call**.
 
-### PII before persistence
+### Privacy model
 
-Redaction runs in the Celery worker **before** any data touches `inference_logs`. The `inference_events` table holds the raw payload temporarily and can be purged after processing. Detectors cover: email, phone, SSN, credit card (with Luhn), IPv4, API keys (OpenAI/Anthropic/AWS patterns), URL query secrets.
-
-### Conversation context vs observability
-
-Messages store both `content` (raw — used for multi-turn LLM context) and `content_redacted` (PII-scrubbed — used in dashboards). This keeps the chatbot accurate while keeping the observability layer privacy-safe.
+| Layer | What's stored | PII handling |
+|---|---|---|
+| `messages.content` | Raw chat text | SDK redacts before LLM call; not duplicated in DB |
+| `inference_logs` | Observability records | SDK redacts before HTTP ingest |
+| Dashboard / logs UI | Reads `inference_logs` | Shows redacted previews and payloads |
 
 ---
 
@@ -723,7 +782,7 @@ Messages store both `content` (raw — used for multi-turn LLM context) and `con
 | Failure | Behaviour |
 |---|---|
 | Postgres down briefly | Services fail fast; Celery jobs stay in Redis and process when Postgres recovers |
-| Duplicate ingest | `ON CONFLICT (id) DO UPDATE` — safe to ingest the same ULID multiple times |
+| Duplicate ingest | `ON CONFLICT (id) DO UPDATE` — safe to ingest the same span id multiple times |
 | Partial worker run | Upsert is atomic per row; crash leaves event as `RECEIVED` and job retries clean |
 
 ### Assumptions
@@ -736,7 +795,7 @@ Messages store both `content` (raw — used for multi-turn LLM context) and `con
 
 ## 18. What Would Improve With More Time
 
-1. **Alembic auto-migrations** — commit versioned migration files so schema changes are tracked and reproducible
+1. **Alembic migrations** — versioned schema changes (e.g. drop unused columns); expand migration history beyond initial revision
 2. **Authentication** — multi-tenant API key auth; user sessions per conversation
 3. **Metric rollup Celery Beat job** — periodic task to materialise `metric_rollups` every minute instead of live aggregation
 4. **Full-text search** — `pg_trgm` index on `input_preview`/`output_preview` for log search
