@@ -23,6 +23,19 @@ try:
 except ImportError:
     _obs = None
 
+try:
+    from llm_obs.pii import redact as _pii_redact
+except ImportError:
+    _pii_redact = None
+
+
+def _redact_text(text: str) -> str:
+    """Return PII-scrubbed version of text, or original if redaction unavailable."""
+    if not _pii_redact or not text:
+        return text
+    redacted, _ = _pii_redact(text)
+    return redacted
+
 router = APIRouter(prefix="/api")
 
 
@@ -81,6 +94,7 @@ async def chat(body: ChatRequest, db: AsyncSession = Depends(get_db)):
             conversation_id=conv.id,
             role=MessageRole.USER,
             content=body.message,
+            content_redacted=_redact_text(body.message),
         )
         db.add(user_msg)
         await db.flush()
@@ -128,6 +142,7 @@ async def chat(body: ChatRequest, db: AsyncSession = Depends(get_db)):
                 conversation_id=conv.id,
                 role=MessageRole.ASSISTANT,
                 content=assistant_content,
+                content_redacted=_redact_text(assistant_content),
                 inference_log_id=uuid.UUID(inference_log_id) if len(inference_log_id) == 36 else None,
             )
             db.add(asst_msg)

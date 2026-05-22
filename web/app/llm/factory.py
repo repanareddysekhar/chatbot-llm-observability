@@ -286,6 +286,7 @@ async def _ollama_stream(model, messages, obs_client, conv_id, cancel_event):
             model=model,
             messages=messages,
             stream=True,
+            stream_options={"include_usage": True},  # Ollama sends usage in a trailing chunk
         )
         async for chunk in stream:
             if cancel_event and cancel_event.is_set():
@@ -303,7 +304,7 @@ async def _ollama_stream(model, messages, obs_client, conv_id, cancel_event):
                     output_chunks.append(delta.content)
                     yield delta.content
 
-            # Ollama returns usage in the final chunk (no stream_options needed)
+            # Usage arrives in a trailing chunk with empty choices (after finish_reason=stop)
             if hasattr(chunk, "usage") and chunk.usage:
                 usage = {
                     "prompt_tokens": chunk.usage.prompt_tokens,
