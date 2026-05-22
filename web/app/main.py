@@ -1,5 +1,13 @@
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env into os.environ before any SDK or discovery code runs.
+# web/.env (local dev) → repo-root .env as fallback.
+load_dotenv(Path(__file__).parent.parent / ".env")           # web/.env (local)
+load_dotenv(Path(__file__).parent.parent.parent / ".env", override=False)  # root .env
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -53,9 +61,9 @@ async def chat_page(request: Request, conv_id: str | None = None):
     if not providers:
         providers = {"ollama": ["gemma3:4b", "llama3.2", "mistral"]}
     return templates.TemplateResponse(
+        request,
         "chat.html",
         {
-            "request": request,
             "active": "chat",
             "conv_id": conv_id or "",
             "providers": providers,
@@ -67,14 +75,14 @@ async def chat_page(request: Request, conv_id: str | None = None):
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
     return templates.TemplateResponse(
-        "dashboard.html", {"request": request, "active": "dashboard"}
+        request, "dashboard.html", {"active": "dashboard"}
     )
 
 
 @app.get("/logs", response_class=HTMLResponse)
 async def logs_page(request: Request):
     return templates.TemplateResponse(
-        "logs.html", {"request": request, "active": "logs"}
+        request, "logs.html", {"active": "logs"}
     )
 
 
