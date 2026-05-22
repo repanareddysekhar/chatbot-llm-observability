@@ -1,93 +1,197 @@
+"""
+Anthropic provider instrumentation.
+
+Patches AsyncMessages.create at class level.
+Streaming uses _InstrumentedAnthropicAsyncStream which wraps the raw event
+iterator returned by create(stream=True).
+"""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
+
+from ..logging import get_logger
 
 if TYPE_CHECKING:
-    from anthropic import Anthropic
     from ..client import ObservabilityClient
 
+logger = get_logger("providers.anthropic")
 
-def wrap_anthropic(
-    client: "Anthropic",
-    obs: "ObservabilityClient",
-    conversation_id_fn: Callable[[], str | None] | None = None,
-) -> "Anthropic":
-    original_create = client.messages.create
+_patched = False
 
-    def instrumented_create(**kwargs: Any) -> Any:
-        conv_id = conversation_id_fn() if conversation_id_fn else None
-        messages = kwargs.get("messages", [])
+
+class _InstrumentedAnthropicAsyncStream:
+    """
+    Wraps Anthropic's async streaming response.
+    Iterates raw events, extracts text/usage, then ends the span.
+    """
+
+    def __init__(self, stream: Any, span: Any) -> None:
+        self._stream = stream
+        self._span = span
+        self._iter = self._generate()
+
+    def __aiter__(self):
+        return self._iter
+
+    async def _generate(self):
+        first_token = True
+        try:
+            async for event in self._stream:
+                etype = type(event).__name__
+
+                if etype == "RawContentBlockDeltaEvent":
+                    text = getattr(event.delta, "text", "")
+                    if text:
+                        if first_token:
+                            self._span.set_ttft()
+                            first_token = False
+                        self._span.append_output(text)
+
+                elif etype == "RawMessageStartEvent":
+                    usage = getattr(getattr(event, "message", None), "usage", None)
+                    if usage:
+                        self._span.set_usage(
+                            prompt_tokens=getattr(usage, "input_tokens", None)
+                        )
+
+                elif etype == "RawMessageDeltaEvent":
+                    usage = getattr(event, "usage", None)
+                    if usage:
+                        self._span.set_usage(
+                            completion_tokens=getattr(usage, "output_tokens", None)
+                        )
+
+                yield event
+
+            if not self._span._ended:
+                self._span.end(status="success", streamed=True)
+
+        except GeneratorExit:
+            if not self._span._ended:
+                self._span.end(status="cancelled", streamed=True)
+            raise
+        except Exception as exc:
+            self._span.set_error(type(exc).__name__, str(exc)[:500])
+            if not self._span._ended:
+                self._span.end(status="error", streamed=True)
+            raise
+
+    async def close(self) -> None:
+        if not self._span._ended:
+            self._span.end(status="cancelled", streamed=True)
+        if hasattr(self._stream, "close"):
+            await self._stream.close()
+        elif hasattr(self._stream, "aclose"):
+            await self._stream.aclose()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+def _make_patched_create(obs: "ObservabilityClient", original):
+    from ..context import get_conversation_id, get_session_id
+
+    async def patched(self_inner, **kwargs: Any) -> Any:
         model = kwargs.get("model", "unknown")
-        stream = kwargs.get("stream", False)
-
+        messages = kwargs.get("messages", [])
         span = obs.start_span(
             provider="anthropic",
             model=model,
             request={
-                "messages": [{"role": m.get("role"), "content": str(m.get("content", ""))[:500]} for m in messages],
-                "temperature": kwargs.get("temperature"),
+                "messages": [
+                    {"role": m.get("role"), "content": str(m.get("content", ""))[:500]}
+                    for m in messages
+                ],
                 "max_tokens": kwargs.get("max_tokens"),
             },
-            conversation_id=conv_id,
+            conversation_id=get_conversation_id(),
+            session_id=get_session_id(),
         )
-
         try:
-            result = original_create(**kwargs)
-
-            if stream:
-                return _wrap_stream_anthropic(result, span)
+            result = await original(self_inner, **kwargs)
+            if kwargs.get("stream"):
+                return _InstrumentedAnthropicAsyncStream(result, span)
             else:
-                usage = result.usage
+                usage = getattr(result, "usage", None)
                 if usage:
                     span.set_usage(
-                        prompt_tokens=usage.input_tokens,
-                        completion_tokens=usage.output_tokens,
+                        prompt_tokens=getattr(usage, "input_tokens", None),
+                        completion_tokens=getattr(usage, "output_tokens", None),
                     )
-                content = ""
-                for block in result.content:
-                    if hasattr(block, "text"):
-                        content += block.text
+                content = "".join(
+                    getattr(b, "text", "") for b in getattr(result, "content", [])
+                )
                 span.append_output(content)
-                span.end(status="success", finish_reason=result.stop_reason, streamed=False)
+                span.end(
+                    status="success",
+                    finish_reason=getattr(result, "stop_reason", None),
+                    streamed=False,
+                )
                 return result
-
         except Exception as exc:
             span.set_error(type(exc).__name__, str(exc)[:500])
             span.end(status="error")
             raise
 
-    client.messages.create = instrumented_create
-    return client
+    return patched
 
 
-def _wrap_stream_anthropic(stream: Any, span: Any) -> Any:
-    first_token = True
-    finish_reason = None
+def patch_anthropic_class(obs: "ObservabilityClient") -> bool:
+    global _patched
+    if _patched:
+        return True
     try:
-        with stream as s:
-            for event in s:
-                event_type = type(event).__name__
-                if event_type == "RawContentBlockDeltaEvent":
-                    delta = getattr(event.delta, "text", "")
-                    if delta:
-                        if first_token:
-                            span.set_ttft()
-                            first_token = False
-                        span.append_output(delta)
-                elif event_type == "RawMessageDeltaEvent":
-                    finish_reason = getattr(event.delta, "stop_reason", None)
-                    usage = getattr(event.usage, None, None)
-                    if usage:
-                        span.set_usage(completion_tokens=getattr(usage, "output_tokens", None))
-                elif event_type == "RawMessageStartEvent":
-                    usage = getattr(event.message, "usage", None)
-                    if usage:
-                        span.set_usage(prompt_tokens=getattr(usage, "input_tokens", None))
-                yield event
-    except Exception as exc:
-        span.set_error(type(exc).__name__, str(exc)[:500])
-        span.end(status="error", streamed=True)
-        raise
-    finally:
-        if not span._ended:
-            span.end(status="success", finish_reason=finish_reason, streamed=True)
+        from anthropic.resources.messages import AsyncMessages
+        original = AsyncMessages.create
+        AsyncMessages.create = _make_patched_create(obs, original)
+        _patched = True
+        logger.debug("Patched anthropic.AsyncMessages.create")
+        return True
+    except ImportError:
+        return False
+
+
+def wrap_anthropic(client: Any, obs: "ObservabilityClient") -> Any:
+    """Explicit instance-level wrap (alternative to auto_instrument)."""
+    from ..context import get_conversation_id, get_session_id
+    original_create = client.messages.create
+
+    async def instrumented(**kwargs: Any) -> Any:
+        model = kwargs.get("model", "unknown")
+        messages = kwargs.get("messages", [])
+        span = obs.start_span(
+            provider="anthropic",
+            model=model,
+            request={
+                "messages": [
+                    {"role": m.get("role"), "content": str(m.get("content", ""))[:500]}
+                    for m in messages
+                ],
+            },
+            conversation_id=get_conversation_id(),
+            session_id=get_session_id(),
+        )
+        try:
+            result = await original_create(**kwargs)
+            if kwargs.get("stream"):
+                return _InstrumentedAnthropicAsyncStream(result, span)
+            else:
+                usage = getattr(result, "usage", None)
+                if usage:
+                    span.set_usage(
+                        prompt_tokens=getattr(usage, "input_tokens", None),
+                        completion_tokens=getattr(usage, "output_tokens", None),
+                    )
+                content = "".join(
+                    getattr(b, "text", "") for b in getattr(result, "content", [])
+                )
+                span.append_output(content)
+                span.end(status="success", finish_reason=getattr(result, "stop_reason", None))
+                return result
+        except Exception as exc:
+            span.set_error(type(exc).__name__, str(exc)[:500])
+            span.end(status="error")
+            raise
+
+    client.messages.create = instrumented
+    return client

@@ -53,6 +53,8 @@ class IngestPayload(BaseModel):
     request: RequestPayload
     response: ResponsePayload | None = None
     usage: UsagePayload | None = None
+    # SDK computes cost_usd before shipping — worker uses this if present
+    cost_usd: float | None = None
     error: ErrorPayload | None = None
     sdk_version: str | None = None
     environment: str = "dev"

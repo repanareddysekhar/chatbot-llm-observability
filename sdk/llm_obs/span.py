@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from .id import new_id
+from .metrics.cost import compute_cost
 
 if TYPE_CHECKING:
     from .client import ObservabilityClient
@@ -23,7 +24,9 @@ class InferenceSpan:
 
     _client: "ObservabilityClient | None" = field(default=None, repr=False)
     _started_at: float = field(default_factory=time.monotonic, repr=False)
-    _started_iso: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), repr=False)
+    _started_iso: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(), repr=False
+    )
     _ttft_ms: int | None = field(default=None, repr=False)
     _output_chunks: list[str] = field(default_factory=list, repr=False)
     _usage: dict[str, int] = field(default_factory=dict, repr=False)
@@ -32,12 +35,19 @@ class InferenceSpan:
 
     def set_ttft(self, ms: int | None = None) -> None:
         if self._ttft_ms is None:
-            self._ttft_ms = ms if ms is not None else int((time.monotonic() - self._started_at) * 1000)
+            self._ttft_ms = (
+                ms if ms is not None
+                else int((time.monotonic() - self._started_at) * 1000)
+            )
 
     def append_output(self, chunk: str) -> None:
         self._output_chunks.append(chunk)
 
-    def set_usage(self, prompt_tokens: int | None = None, completion_tokens: int | None = None) -> None:
+    def set_usage(
+        self,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+    ) -> None:
         if prompt_tokens is not None:
             self._usage["prompt_tokens"] = prompt_tokens
         if completion_tokens is not None:
@@ -51,7 +61,12 @@ class InferenceSpan:
     def set_metadata(self, **kwargs: Any) -> None:
         self.metadata.update(kwargs)
 
-    def end(self, status: str = "success", finish_reason: str | None = None, streamed: bool = False) -> None:
+    def end(
+        self,
+        status: str = "success",
+        finish_reason: str | None = None,
+        streamed: bool = False,
+    ) -> None:
         if self._ended:
             return
         self._ended = True
@@ -59,6 +74,14 @@ class InferenceSpan:
         ended_at = datetime.now(timezone.utc).isoformat()
         latency_ms = int((time.monotonic() - self._started_at) * 1000)
         full_output = "".join(self._output_chunks)
+
+        prompt_tokens = self._usage.get("prompt_tokens")
+        completion_tokens = self._usage.get("completion_tokens")
+
+        # Cost computed deterministically in the SDK — no worker needed
+        cost_usd = compute_cost(
+            self.provider, self.model, prompt_tokens, completion_tokens
+        )
 
         payload: dict[str, Any] = {
             "id": self.id,
@@ -78,6 +101,7 @@ class InferenceSpan:
                 "finish_reason": finish_reason,
             },
             "usage": self._usage or None,
+            "cost_usd": cost_usd,
             "error": self._error,
             "metadata": self.metadata or None,
         }

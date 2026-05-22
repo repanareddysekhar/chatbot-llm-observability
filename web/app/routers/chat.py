@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
@@ -13,15 +12,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..database import get_db
-from ..llm.factory import stream_chat, _new_id
 from ..models import Conversation, ConversationStatus, Message, MessageRole, Provider
+
+try:
+    from llm_obs import stream_chat
+except ImportError:
+    async def stream_chat(*_, **__):  # type: ignore
+        yield "SDK not installed"
 from .. import cancel_registry
 
 try:
-    from llm_obs import ObservabilityClient
-    _obs = ObservabilityClient(endpoint=settings.ingest_url, api_key=settings.ingest_api_key)
+    from llm_obs import set_obs_context
+    from llm_obs.id import new_id
 except ImportError:
-    _obs = None
+    def set_obs_context(**_): pass  # type: ignore
+    import uuid as _uuid
+    def new_id(): return str(_uuid.uuid4())  # type: ignore
 
 try:
     from llm_obs.pii import redact as _pii_redact
@@ -30,11 +36,11 @@ except ImportError:
 
 
 def _redact_text(text: str) -> str:
-    """Return PII-scrubbed version of text, or original if redaction unavailable."""
     if not _pii_redact or not text:
         return text
     redacted, _ = _pii_redact(text)
     return redacted
+
 
 router = APIRouter(prefix="/api")
 
@@ -80,11 +86,8 @@ async def chat(body: ChatRequest, db: AsyncSession = Depends(get_db)):
         )
         history = msgs_result.scalars().all()
 
-        # Build messages list
-        llm_messages = [
-            {"role": "system", "content": "You are a helpful assistant."}
-        ]
-        for m in history[-20:]:  # keep last 20 for context
+        llm_messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        for m in history[-20:]:
             llm_messages.append({"role": m.role.value.lower(), "content": m.content})
         llm_messages.append({"role": "user", "content": body.message})
 
@@ -99,10 +102,13 @@ async def chat(body: ChatRequest, db: AsyncSession = Depends(get_db)):
         db.add(user_msg)
         await db.flush()
 
-        inference_log_id = _new_id()
+        inference_log_id = new_id()
         cancel_event = cancel_registry.register(inference_log_id)
 
-        # Send meta event
+        # Tell the SDK which conversation this belongs to —
+        # providers pick this up via contextvars, no parameter threading needed
+        set_obs_context(conversation_id=str(conv.id))
+
         yield {
             "event": "meta",
             "data": json.dumps({
@@ -111,15 +117,12 @@ async def chat(body: ChatRequest, db: AsyncSession = Depends(get_db)):
             }),
         }
 
-        # Stream from LLM
         full_response = []
         try:
             async for chunk in stream_chat(
                 provider=body.provider,
                 model=body.model,
                 messages=llm_messages,
-                obs_client=_obs,
-                conversation_id=str(conv.id),
                 cancel_event=cancel_event,
             ):
                 full_response.append(chunk)
@@ -134,7 +137,6 @@ async def chat(body: ChatRequest, db: AsyncSession = Depends(get_db)):
         finally:
             cancel_registry.unregister(inference_log_id)
 
-        # Persist assistant message
         assistant_content = "".join(full_response)
         if assistant_content:
             asst_msg = Message(

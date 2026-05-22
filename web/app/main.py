@@ -8,13 +8,25 @@ from fastapi.templating import Jinja2Templates
 
 from .config import settings
 from .database import engine, Base
-from .llm.factory import get_provider_client
+from llm_obs import available_providers
 from .routers import chat, conversations, dashboard
+
+
+try:
+    from llm_obs import ObservabilityClient
+    _obs = ObservabilityClient(
+        endpoint=settings.ingest_url,
+        api_key=settings.ingest_api_key,
+        environment=settings.environment,
+        redact_pii=True,
+    )
+    _obs.auto_instrument()  # patches openai / anthropic / gemini / bedrock at class level
+except Exception:
+    pass  # observability is never allowed to break the app
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Tables are created by ingestion service; web only reads
     yield
 
 
@@ -37,10 +49,8 @@ async def root():
 @app.get("/chat", response_class=HTMLResponse)
 @app.get("/chat/{conv_id}", response_class=HTMLResponse)
 async def chat_page(request: Request, conv_id: str | None = None):
-    providers = get_provider_client()
+    providers = available_providers()
     if not providers:
-        # If nothing is configured, at least show Ollama with common models
-        # so the UI is usable without any cloud API keys
         providers = {"ollama": ["gemma3:4b", "llama3.2", "mistral"]}
     return templates.TemplateResponse(
         "chat.html",
