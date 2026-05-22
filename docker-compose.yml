@@ -20,8 +20,8 @@ services:
 
   ingestion:
     build:
-      context: .
-      dockerfile: ingestion/Dockerfile
+      context: ingestion
+      dockerfile: Dockerfile
     environment:
       DATABASE_URL: postgresql+asyncpg://obs:obs@postgres:5432/obs
       REDIS_URL: redis://redis:6379/0
@@ -38,8 +38,8 @@ services:
 
   worker:
     build:
-      context: .
-      dockerfile: ingestion/Dockerfile
+      context: ingestion
+      dockerfile: Dockerfile
     command: celery -A app.worker worker -l info -c 4
     environment:
       DATABASE_URL: postgresql+asyncpg://obs:obs@postgres:5432/obs
@@ -54,8 +54,8 @@ services:
 
   web:
     build:
-      context: .
-      dockerfile: web/Dockerfile
+      context: web
+      dockerfile: Dockerfile
     environment:
       DATABASE_URL: postgresql+asyncpg://obs:obs@postgres:5432/obs
       INGEST_URL: http://ingestion:4000

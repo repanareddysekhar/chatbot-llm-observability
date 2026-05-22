@@ -134,16 +134,29 @@ class ObservabilityClient:
         """Redact PII from request and response fields before transport."""
         import copy
         payload = copy.deepcopy(payload)
+        all_detections: list[dict[str, int]] = []
         try:
             if payload.get("request"):
-                clean_req, _ = self._pii_redact_fn(payload["request"])
+                clean_req, req_det = self._pii_redact_fn(payload["request"])
                 payload["request"] = clean_req
+                all_detections.extend(req_det)
             if payload.get("response"):
-                clean_resp, _ = self._pii_redact_fn(payload["response"])
+                clean_resp, resp_det = self._pii_redact_fn(payload["response"])
                 payload["response"] = clean_resp
+                all_detections.extend(resp_det)
+            if all_detections:
+                payload["pii_detections"] = all_detections
         except Exception as exc:
             logger.warning("PII redaction failed: %s", exc)
         return payload
+
+    def redact_text(self, text: str) -> str:
+        """Redact PII from a plain string. Respects the redact_pii setting."""
+        if not self._pii_redact_fn or not text:
+            return text
+        from .pii import redact
+        redacted, _ = redact(text)
+        return redacted
 
     def flush(self) -> None:
         self._transport.flush()

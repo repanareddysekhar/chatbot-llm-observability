@@ -5,8 +5,22 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "llm-obs"
 version = "0.1.0"
-description = "Lightweight SDK for LLM inference logging"
+description = "Lightweight SDK for LLM inference logging and observability"
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.11"
+keywords = ["llm", "observability", "logging", "openai", "anthropic", "gemini", "bedrock", "tracing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Logging",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "httpx>=0.27",
     "ulid-py>=1.1",
@@ -16,8 +30,18 @@ dependencies = [
 openai    = ["openai>=1.30"]
 anthropic = ["anthropic>=0.30"]
 gemini    = ["google-generativeai>=0.7"]
-all       = ["openai>=1.30", "anthropic>=0.30", "google-generativeai>=0.7"]
+bedrock   = ["boto3>=1.34"]
+all       = [
+    "openai>=1.30",
+    "anthropic>=0.30",
+    "google-generativeai>=0.7",
+    "boto3>=1.34",
+]
+
+[project.urls]
+Homepage   = "https://github.com/repanareddysekhara/llm-observability"
+Repository = "https://github.com/repanareddysekhara/llm-observability"
 
 [tool.setuptools.packages.find]
-where = [""]
+where   = [""]
 include = ["llm_obs*"]

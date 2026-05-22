@@ -30,15 +30,15 @@ except ImportError:
     def new_id(): return str(_uuid.uuid4())  # type: ignore
 
 try:
-    from llm_obs.pii import redact as _pii_redact
+    from llm_obs import redact_text as _redact_text_fn
 except ImportError:
-    _pii_redact = None
+    _redact_text_fn = None
 
 
 def _redact_text(text: str) -> str:
-    if not _pii_redact or not text:
+    if not _redact_text_fn or not text:
         return text
-    redacted, _ = _pii_redact(text)
+    redacted, _ = _redact_text_fn(text)
     return redacted
 
 

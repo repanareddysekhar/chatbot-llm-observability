@@ -77,18 +77,10 @@ def _process(db: Session, event_id: str, payload: dict[str, Any]) -> None:
         if prompt_tokens or completion_tokens else None
     )
 
-    # PII redaction — safety net (SDK already redacts before shipping)
+    # PII redaction runs in the SDK client before ingest
     request_payload = payload.get("request") or {}
     response_payload = payload.get("response") or {}
-    all_detections: list[dict] = []
-
-    try:
-        from llm_obs.pii import redact_deep
-        request_payload, req_det = redact_deep(request_payload)
-        response_payload, resp_det = redact_deep(response_payload)
-        all_detections = req_det + resp_det
-    except ImportError:
-        pass
+    all_detections: list[dict] = payload.get("pii_detections") or []
 
     # Input/output previews
     messages = request_payload.get("messages") or []

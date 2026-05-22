@@ -55,6 +55,8 @@ class IngestPayload(BaseModel):
     usage: UsagePayload | None = None
     # SDK computes cost_usd before shipping — worker uses this if present
     cost_usd: float | None = None
+    # PII redacted in the SDK before ingest — worker stores as-is
+    pii_detections: list[dict[str, Any]] | None = None
     error: ErrorPayload | None = None
     sdk_version: str | None = None
     environment: str = "dev"

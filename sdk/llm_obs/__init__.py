@@ -1,4 +1,5 @@
 from .client import ObservabilityClient
+from .pii import redact as redact_text
 from .context import set_obs_context, get_conversation_id, get_session_id, clear_obs_context
 from .streaming import stream_chat, available_providers
 from .discovery import discover_from_env, detect_provider, DiscoveredProvider
@@ -10,6 +11,7 @@ from .providers.bedrock import wrap_bedrock
 __all__ = [
     # ── Primary interface ──────────────────────────────────────────
     "ObservabilityClient",   # init + auto_instrument — all you need in your app
+    "redact_text",           # PII redaction helper (runs in the client process)
     "stream_chat",           # unified streaming across all providers
     "available_providers",   # check which providers are configured
     # ── Context (per-request metadata) ────────────────────────────
