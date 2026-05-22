@@ -17,10 +17,13 @@ import os
 from typing import AsyncIterator, Any
 
 from .logging import get_logger
+from .guard import sanitize_messages_for_llm
 from .discovery import (
     DiscoveredProvider,
     discover_from_env,
     to_providers_dict,
+    openai_base_url,
+    _bedrock_region_from_url,
 )
 
 logger = get_logger("streaming")
@@ -36,9 +39,13 @@ def _get_discovered() -> list[DiscoveredProvider]:
     return _discovered_cache
 
 
-def _find_provider(provider: str) -> DiscoveredProvider | None:
+def _find_endpoint(key: str) -> DiscoveredProvider | None:
+    """Resolve UI/API provider key to a discovered endpoint."""
     for d in _get_discovered():
-        if d.provider == provider:
+        if d.key == key:
+            return d
+    for d in _get_discovered():
+        if d.provider == key:
             return d
     return None
 
@@ -61,42 +68,49 @@ async def stream_chat(
     Unified async streaming entry point. Yields text delta chunks.
     Provider config (URL, API key) resolved from discovered providers.
     Observability injected transparently by auto_instrument().
+
+    PII is sanitized here once, before any provider SDK is called.
     """
-    if provider in ("openai", "openai_compatible", "ollama"):
-        async for chunk in _openai_compat_stream(provider, model, messages, cancel_event):
+    messages = sanitize_messages_for_llm(messages)
+    info = _find_endpoint(provider)
+    if not info:
+        available = [d.key for d in _get_discovered()]
+        raise ValueError(f"Unknown endpoint {provider!r}. Available: {available}")
+
+    route = info.provider
+    if route in ("openai", "openai_compatible", "ollama"):
+        async for chunk in _openai_compat_stream(info, model, messages, cancel_event):
             yield chunk
-    elif provider == "anthropic":
-        async for chunk in _anthropic_stream(model, messages, cancel_event):
+    elif route == "anthropic":
+        async for chunk in _anthropic_stream(model, messages, cancel_event, info):
             yield chunk
-    elif provider == "google":
-        async for chunk in _gemini_stream(model, messages, cancel_event):
+    elif route == "google":
+        async for chunk in _gemini_stream(model, messages, cancel_event, info):
             yield chunk
-    elif provider == "bedrock":
-        async for chunk in _bedrock_stream(model, messages, cancel_event):
+    elif route == "bedrock":
+        async for chunk in _bedrock_stream(model, messages, cancel_event, info):
             yield chunk
     else:
-        raise ValueError(f"Unknown provider: {provider!r}")
+        raise ValueError(f"Unsupported provider type: {route!r}")
 
 
 async def _openai_compat_stream(
-    provider: str,
+    info: DiscoveredProvider,
     model: str,
     messages: list[dict],
     cancel_event: asyncio.Event | None,
 ) -> AsyncIterator[str]:
     """
-    Handles OpenAI, Ollama, vLLM, LiteLLM and any OpenAI-compatible endpoint.
-    URL and api_key resolved from discovered provider registry.
+    Handles OpenAI, Ollama, vLLM, LiteLLM, ngrok, private VPC, and any OpenAI-compatible endpoint.
     """
     from openai import AsyncOpenAI
 
-    info = _find_provider(provider)
-    if info and info.base_url and "openai.com" not in info.base_url:
-        base_url = info.base_url.rstrip("/") + "/v1"
+    if info.base_url and "api.openai.com" not in info.base_url:
+        base_url = openai_base_url(info.base_url)
         api_key = info.api_key or "no-key"
     else:
         base_url = None
-        api_key = (info.api_key if info else None) or os.environ.get("OPENAI_API_KEY")
+        api_key = info.api_key or os.environ.get("OPENAI_API_KEY")
 
     client = AsyncOpenAI(base_url=base_url, api_key=api_key)
     stream = await client.chat.completions.create(
@@ -117,10 +131,11 @@ async def _anthropic_stream(
     model: str,
     messages: list[dict],
     cancel_event: asyncio.Event | None,
+    info: DiscoveredProvider | None = None,
 ) -> AsyncIterator[str]:
     from anthropic import AsyncAnthropic
 
-    info = _find_provider("anthropic")
+    info = info or _find_endpoint("anthropic")
     api_key = (info.api_key if info else None) or os.environ.get("ANTHROPIC_API_KEY")
     client = AsyncAnthropic(api_key=api_key)
 
@@ -147,10 +162,11 @@ async def _gemini_stream(
     model: str,
     messages: list[dict],
     cancel_event: asyncio.Event | None,
+    info: DiscoveredProvider | None = None,
 ) -> AsyncIterator[str]:
     import google.generativeai as genai
 
-    info = _find_provider("google")
+    info = info or _find_endpoint("google")
     api_key = (info.api_key if info else None) or os.environ.get("GOOGLE_API_KEY")
     genai.configure(api_key=api_key)
 
@@ -178,12 +194,18 @@ async def _bedrock_stream(
     model: str,
     messages: list[dict],
     cancel_event: asyncio.Event | None,
+    info: DiscoveredProvider | None = None,
 ) -> AsyncIterator[str]:
-    """Stream from AWS Bedrock. Uses Anthropic-format body (supported by most models)."""
+    """Stream from AWS Bedrock."""
     import json
     import boto3
 
+    info = info or _find_endpoint("bedrock")
     region = os.environ.get("AWS_REGION", "us-east-1")
+    if info and info.meta.get("region"):
+        region = info.meta["region"]
+    elif info and info.base_url:
+        region = _bedrock_region_from_url(info.base_url)
     bedrock = boto3.client("bedrock-runtime", region_name=region)
 
     system = next((m["content"] for m in messages if m["role"] == "system"), None)

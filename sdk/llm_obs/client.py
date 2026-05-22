@@ -9,6 +9,12 @@ from .transport import BatchTransport
 
 logger = get_logger("client")
 
+_ACTIVE_CLIENT: "ObservabilityClient | None" = None
+
+
+def get_active_client() -> "ObservabilityClient | None":
+    return _ACTIVE_CLIENT
+
 
 class ObservabilityClient:
     """
@@ -29,7 +35,7 @@ class ObservabilityClient:
         endpoint: str | None = None,
         api_key: str | None = None,
         environment: str | None = None,
-        sdk_version: str = "0.1.0",
+        sdk_version: str = "0.1.1",
         batch_size: int = 20,
         flush_interval_s: float = 2.0,
         max_retries: int = 3,
@@ -43,6 +49,9 @@ class ObservabilityClient:
         self.sdk_version = sdk_version
         self.default_metadata = default_metadata or {}
         self.redact_pii = redact_pii
+
+        global _ACTIVE_CLIENT
+        _ACTIVE_CLIENT = self
 
         self._transport = BatchTransport(
             endpoint=self.endpoint,
@@ -77,20 +86,9 @@ class ObservabilityClient:
           - google.generativeai  (GenerativeModel.generate_content_async)
           - boto3 bedrock-runtime  (invoke_model / invoke_model_with_response_stream)
         """
-        from .providers.openai import patch_openai_class
-        from .providers.anthropic import patch_anthropic_class
-        from .providers.gemini import patch_gemini_class
-        from .providers.bedrock import patch_bedrock_client
+        from .providers.interceptor import install_provider_interceptors
 
-        patched = []
-        if patch_openai_class(self):
-            patched.append("openai")
-        if patch_anthropic_class(self):
-            patched.append("anthropic")
-        if patch_gemini_class(self):
-            patched.append("gemini")
-        if patch_bedrock_client(self):
-            patched.append("bedrock")
+        patched = install_provider_interceptors(self)
 
         if patched:
             logger.info("auto_instrument patched: %s", ", ".join(patched))
@@ -152,11 +150,10 @@ class ObservabilityClient:
 
     def redact_text(self, text: str) -> str:
         """Redact PII from a plain string. Respects the redact_pii setting."""
-        if not self._pii_redact_fn or not text:
+        from .guard import sanitize_text_for_llm
+        if not self.redact_pii or not text:
             return text
-        from .pii import redact
-        redacted, _ = redact(text)
-        return redacted
+        return sanitize_text_for_llm(text)
 
     def flush(self) -> None:
         self._transport.flush()

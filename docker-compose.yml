@@ -60,11 +60,18 @@ services:
       DATABASE_URL: postgresql+asyncpg://obs:obs@postgres:5432/obs
       INGEST_URL: http://ingestion:4000
       INGEST_API_KEY: dev-key
+      LLM_ENDPOINTS: ${LLM_ENDPOINTS:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
-      # For Ollama running on your Mac host, use host.docker.internal
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      BEDROCK_ENABLED: ${BEDROCK_ENABLED:-}
+      BEDROCK_RUNTIME_URL: ${BEDROCK_RUNTIME_URL:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_PROFILE: ${AWS_PROFILE:-}
       ENVIRONMENT: prod
     depends_on:
       ingestion:

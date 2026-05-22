@@ -59,3 +59,9 @@ def redact_deep(value: Any) -> tuple[Any, list[dict[str, int]]]:
     result = _walk(value)
     detections = [{"type": k, "count": v} for k, v in all_detections.items()]
     return result, detections
+
+
+def redact_messages(messages: list[dict]) -> tuple[list[dict], list[dict[str, int]]]:
+    """Redact PII from a chat messages list before sending to an LLM provider."""
+    import copy
+    return redact_deep(copy.deepcopy(messages))

@@ -29,3 +29,7 @@ install:
 	cd sdk       && pip install -e .
 	cd ingestion && pip install -r requirements.txt
 	cd web       && pip install -r requirements.txt
+
+publish-sdk:
+	cd sdk && python -m build
+	cd sdk && twine upload dist/llm_obs-$${VERSION:-0.1.1}*
