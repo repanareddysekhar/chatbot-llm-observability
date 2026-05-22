@@ -42,14 +42,48 @@ PRICE_TABLE: dict[str, dict[str, float]] = {
     "google:gemini-1.5-flash":            {"input": 0.075 / 1e6, "output": 0.30 / 1e6},
     "google:gemini-1.5-pro":             {"input": 1.25 / 1e6, "output": 5.00 / 1e6},
     "google:gemini-2.0-flash":           {"input": 0.10 / 1e6, "output": 0.40 / 1e6},
-    # Ollama (local) — cost is $0.00 by definition
-    # All ollama:* keys return 0 cost via the fallback in _compute_cost
 }
+
+# Estimated local compute cost for Ollama models.
+# Based on ~$0.10-0.40/hr GPU amortised at typical token throughput per model tier.
+# Used purely for observability comparisons — not real billing.
+_OLLAMA_PRICE_TABLE: dict[str, dict[str, float]] = {
+    # Sub-2B models — very fast on CPU, minimal power draw
+    "gemma3:1b":       {"input": 0.02 / 1e6, "output": 0.02 / 1e6},
+    "llama3.2:1b":     {"input": 0.02 / 1e6, "output": 0.02 / 1e6},
+    "phi3:mini":       {"input": 0.02 / 1e6, "output": 0.02 / 1e6},
+    "gemma2:2b":       {"input": 0.02 / 1e6, "output": 0.02 / 1e6},
+    "deepseek-r1:1.5b":{"input": 0.02 / 1e6, "output": 0.02 / 1e6},
+    # 4B–8B models — GPU mid-tier, comparable to gpt-4o-mini efficiency
+    "gemma3:4b":       {"input": 0.08 / 1e6, "output": 0.08 / 1e6},
+    "gemma2:9b":       {"input": 0.08 / 1e6, "output": 0.08 / 1e6},
+    "llama3.2":        {"input": 0.08 / 1e6, "output": 0.08 / 1e6},
+    "llama3.1:8b":     {"input": 0.08 / 1e6, "output": 0.08 / 1e6},
+    "mistral":         {"input": 0.08 / 1e6, "output": 0.08 / 1e6},
+    "mistral:7b":      {"input": 0.08 / 1e6, "output": 0.08 / 1e6},
+    "phi3":            {"input": 0.08 / 1e6, "output": 0.08 / 1e6},
+    "qwen2.5:7b":      {"input": 0.08 / 1e6, "output": 0.08 / 1e6},
+    "deepseek-r1:7b":  {"input": 0.08 / 1e6, "output": 0.08 / 1e6},
+    "codellama:7b":    {"input": 0.08 / 1e6, "output": 0.08 / 1e6},
+    "codellama":       {"input": 0.08 / 1e6, "output": 0.08 / 1e6},
+    # 12B+ models — higher GPU utilisation
+    "gemma3:12b":      {"input": 0.20 / 1e6, "output": 0.20 / 1e6},
+    "llama3.1":        {"input": 0.20 / 1e6, "output": 0.20 / 1e6},
+    "mistral-nemo":    {"input": 0.20 / 1e6, "output": 0.20 / 1e6},
+    "qwen2.5":         {"input": 0.20 / 1e6, "output": 0.20 / 1e6},
+}
+
+# Default estimate for unrecognised Ollama models (mid-tier assumption)
+_OLLAMA_DEFAULT_PRICE = {"input": 0.08 / 1e6, "output": 0.08 / 1e6}
 
 
 def _compute_cost(provider: str, model: str, prompt_tokens: int, completion_tokens: int) -> float | None:
     if provider.lower() == "ollama":
-        return 0.0  # Local models are free
+        # Normalise model name (strip tag variant for lookup, e.g. "llama3.2:latest" → "llama3.2")
+        base_model = model.lower().split(":latest")[0]
+        prices = _OLLAMA_PRICE_TABLE.get(base_model) or _OLLAMA_PRICE_TABLE.get(model.lower()) or _OLLAMA_DEFAULT_PRICE
+        return prices["input"] * prompt_tokens + prices["output"] * completion_tokens
+
     key = f"{provider.lower()}:{model.lower()}"
     prices = PRICE_TABLE.get(key)
     if not prices:

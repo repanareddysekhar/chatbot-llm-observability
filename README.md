@@ -12,8 +12,8 @@ Multi-provider chatbot · Streaming responses · PII redaction · Live metrics d
 2. [Architecture Overview](#architecture-overview)
 3. [Services](#services)
 4. [Setup Instructions](#setup-instructions)
-   - [Docker Compose (recommended)](#option-a-docker-compose-recommended)
-   - [Local Development](#option-b-local-development)
+  - [Docker Compose (recommended)](#option-a-docker-compose-recommended)
+  - [Local Development](#option-b-local-development)
 5. [Configuration](#configuration)
 6. [SDK Usage](#sdk-usage)
 7. [Schema Design Decisions](#schema-design-decisions)
@@ -37,14 +37,17 @@ cp .env.example .env
 docker compose up --build
 ```
 
-| URL | What |
-|---|---|
-| http://localhost:3000/chat | Chat interface |
-| http://localhost:3000/dashboard | Metrics dashboard |
-| http://localhost:3000/logs | Inference log explorer |
-| http://localhost:8080 | Adminer (DB viewer) |
+
+| URL                                                                | What                   |
+| ------------------------------------------------------------------ | ---------------------- |
+| [http://localhost:3000/chat](http://localhost:3000/chat)           | Chat interface         |
+| [http://localhost:3000/dashboard](http://localhost:3000/dashboard) | Metrics dashboard      |
+| [http://localhost:3000/logs](http://localhost:3000/logs)           | Inference log explorer |
+| [http://localhost:8080](http://localhost:8080)                     | Adminer (DB viewer)    |
+
 
 Seed 200 synthetic logs for an instant dashboard demo:
+
 ```bash
 docker compose exec ingestion python -m app.seed
 ```
@@ -66,7 +69,7 @@ docker compose exec ingestion python -m app.seed
 │  /dashboard   → Live metrics + charts                       │
 │  /logs        → Inference log explorer                      │
 │                                                             │
-│  Calls LLM providers via llm_obs SDK wrappers               │
+│  Calls LLM providers via llm_obs SDK wrappers              │
 └──────────────┬──────────────────────────────────────────────┘
                │ POST /v1/ingest/batch (async, fire-and-forget)
                ▼
@@ -98,20 +101,22 @@ Storage:        PostgreSQL 16 (all persistent data)
 Queue/PubSub:   Redis 7
 ```
 
-For detailed diagrams (sequence, ER, class, flow) and architecture notes (ingestion flow, logging strategy, scaling, failure handling) see [`ARCHITECTURE.md`](./ARCHITECTURE.md).
+For detailed diagrams (sequence, ER, class, flow) see `[ARCHITECTURE.md](./ARCHITECTURE.md)`.
 
 ---
 
 ## Services
 
-| Service | Port | Tech | Role |
-|---|---|---|---|
-| `web` | 3000 | FastAPI + Jinja2 | Chat UI, dashboard, conversation management |
-| `ingestion` | 4000 | FastAPI | Receives SDK logs, enqueues Celery jobs |
-| `worker` | — | Celery | Processes logs: PII redact, cost, DB write |
-| `postgres` | 5432 | PostgreSQL 16 | All persistent storage |
-| `redis` | 6379 | Redis 7 | Celery broker + Pub/Sub |
-| `adminer` | 8080 | Adminer | DB admin UI |
+
+| Service     | Port | Tech             | Role                                        |
+| ----------- | ---- | ---------------- | ------------------------------------------- |
+| `web`       | 3000 | FastAPI + Jinja2 | Chat UI, dashboard, conversation management |
+| `ingestion` | 4000 | FastAPI          | Receives SDK logs, enqueues Celery jobs     |
+| `worker`    | —    | Celery           | Processes logs: PII redact, cost, DB write  |
+| `postgres`  | 5432 | PostgreSQL 16    | All persistent storage                      |
+| `redis`     | 6379 | Redis 7          | Celery broker + Pub/Sub                     |
+| `adminer`   | 8080 | Adminer          | DB admin UI                                 |
+
 
 ---
 
@@ -145,6 +150,7 @@ docker compose exec ingestion python -m app.seed
 ```
 
 **Stopping:**
+
 ```bash
 docker compose down          # stop containers
 docker compose down -v       # stop + wipe database volumes
@@ -222,6 +228,7 @@ ENVIRONMENT=dev
 ```
 
 **Ollama quick start:**
+
 ```bash
 # Install Ollama from https://ollama.com, then:
 ollama pull gemma3:4b       # ~3GB, good balance of speed/quality
@@ -308,54 +315,64 @@ span.end(status="success", finish_reason="stop", streamed=True)
 ## Schema Design Decisions
 
 ### `conversations`
+
 Tracks chat sessions. Soft-delete via `status=ARCHIVED` keeps history intact without permanent deletion. `model` and `provider` columns store the last-used settings so resumed conversations default to the same configuration.
 
 ### `messages`
+
 Two content columns: `content` (raw, used for LLM context window) and `content_redacted` (PII-scrubbed, used in dashboards). This allows accurate multi-turn conversations while keeping the observability layer privacy-safe. Setting `STORE_RAW_MESSAGES=false` can disable raw storage for stricter environments.
 
 ### `inference_logs`
+
 The core table — one row per LLM call. Key design choices:
 
 - **SDK-generated ULID as primary key** — allows the worker's `ON CONFLICT DO UPDATE` upsert to be idempotent, making Celery retries completely safe
-- **`request_payload` + `response_payload` as JSONB** — schema-free, handles evolving LLM API response shapes without migrations
-- **`input_preview` / `output_preview`** (256 chars, PII-redacted) — fast dashboard display without loading full payloads
-- **`input_hash`** (sha256 of request) — enables duplicate detection and caching analysis
-- **`ttft_ms`** (time-to-first-token) — critical for streaming UX quality measurement, stored separately from total `latency_ms`
-- **`cost_usd`** computed in the worker — keeps the hot path lean; price table is easily updated
+- `**request_payload` + `response_payload` as JSONB** — schema-free, handles evolving LLM API response shapes without migrations
+- `**input_preview` / `output_preview`** (256 chars, PII-redacted) — fast dashboard display without loading full payloads
+- `**input_hash**` (sha256 of request) — enables duplicate detection and caching analysis
+- `**ttft_ms**` (time-to-first-token) — critical for streaming UX quality measurement, stored separately from total `latency_ms`
+- `**cost_usd**` computed in the worker — keeps the hot path lean; price table is easily updated
 
 ### `inference_events`
+
 Audit/replay buffer. Every raw SDK payload is written here *before* the Celery job runs. If the worker has a bug and corrupts data, you can:
+
 ```sql
 UPDATE inference_events SET status = 'RECEIVED', error = NULL
 WHERE status = 'FAILED';
 -- Then re-enqueue jobs manually
 ```
+
 Status lifecycle: `RECEIVED → PROCESSED` (success) or `RECEIVED → FAILED` (all retries exhausted).
 
 ### `metric_rollups`
+
 Pre-aggregated 1-minute buckets keyed by `(bucket, provider, model)`. Dashboard time-series queries for 7d+ ranges hit this table instead of scanning all of `inference_logs`. Falls back to live aggregation for recent minutes not yet rolled up. The PK design means upserts are safe and idempotent.
 
 ---
 
 ## Tradeoffs Made
 
-| Decision | Chosen | Alternative | Reason |
-|---|---|---|---|
-| **Queue** | Celery + Redis | Kafka, RabbitMQ | Celery is operationally trivial; Redis already present; sufficient for POC throughput |
-| **Analytics DB** | PostgreSQL only | ClickHouse, TimescaleDB | JSONB + percentile functions handle POC volume; avoids another infra dependency |
-| **Streaming protocol** | SSE (Server-Sent Events) | WebSockets | SSE is unidirectional, works behind every HTTP proxy, simpler to implement |
-| **PII detection** | Custom regex + Luhn | Microsoft Presidio, AWS Comprehend | Zero external services; deterministic; no data leaves the system; fast |
-| **UI framework** | Jinja2 + Tailwind CDN | React/Next.js | Python-only project; no Node.js or build pipeline needed |
-| **Idempotency** | ULID primary key + `ON CONFLICT DO UPDATE` | Deduplication table | Simpler; ULID is already unique per call; safe for unlimited retries |
-| **Multi-turn context** | Last 20 messages from DB | Full history / vector search | Keeps prompt size predictable; avoids context overflow for POC |
-| **Cost computation** | Hardcoded price table in worker | External pricing API | Eliminates a network dependency; easily updated; transparent |
-| **Local LLMs** | Ollama (OpenAI-compatible `/v1`) | llama.cpp directly | Reuses existing OpenAI client code; Ollama manages model downloads and GPU |
+
+| Decision               | Chosen                                     | Alternative                        | Reason                                                                                |
+| ---------------------- | ------------------------------------------ | ---------------------------------- | ------------------------------------------------------------------------------------- |
+| **Queue**              | Celery + Redis                             | Kafka, RabbitMQ                    | Celery is operationally trivial; Redis already present; sufficient for POC throughput |
+| **Analytics DB**       | PostgreSQL only                            | ClickHouse, TimescaleDB            | JSONB + percentile functions handle POC volume; avoids another infra dependency       |
+| **Streaming protocol** | SSE (Server-Sent Events)                   | WebSockets                         | SSE is unidirectional, works behind every HTTP proxy, simpler to implement            |
+| **PII detection**      | Custom regex + Luhn                        | Microsoft Presidio, AWS Comprehend | Zero external services; deterministic; no data leaves the system; fast                |
+| **UI framework**       | Jinja2 + Tailwind CDN                      | React/Next.js                      | Python-only project; no Node.js or build pipeline needed                              |
+| **Idempotency**        | ULID primary key + `ON CONFLICT DO UPDATE` | Deduplication table                | Simpler; ULID is already unique per call; safe for unlimited retries                  |
+| **Multi-turn context** | Last 20 messages from DB                   | Full history / vector search       | Keeps prompt size predictable; avoids context overflow for POC                        |
+| **Cost computation**   | Hardcoded price table in worker            | External pricing API               | Eliminates a network dependency; easily updated; transparent                          |
+| **Local LLMs**         | Ollama (OpenAI-compatible `/v1`)           | llama.cpp directly                 | Reuses existing OpenAI client code; Ollama manages model downloads and GPU            |
+
 
 ---
 
 ## What I'd Improve with More Time
 
 **Infrastructure & Reliability**
+
 1. **Committed Alembic migrations** — auto-generate the initial migration file so schema is versioned and reproducible across environments
 2. **Celery Beat rollup job** — periodic task every 60s to materialize `metric_rollups` instead of live aggregation, making 7d+ queries instant
 3. **Kafka instead of Redis queue** — persistent message log enables true replay without the `inference_events` workaround
@@ -376,17 +393,20 @@ Pre-aggregated 1-minute buckets keyed by `(bucket, provider, model)`. Dashboard 
 
 ## Bonus Features Implemented
 
-| Feature | How |
-|---|---|
-| ✅ Multi-provider support | OpenAI, Anthropic, Google Gemini, Ollama — switchable per chat message |
-| ✅ Streaming responses | SSE end-to-end: LLM → FastAPI → Browser, with TTFT measurement |
-| ✅ Live dashboard | Redis Pub/Sub → SSE → Chart.js charts auto-update as logs arrive |
-| ✅ Latency / Throughput / Error dashboards | p50/p95/p99 latency, requests over time, error breakdown by type |
-| ✅ Event-based architecture | Celery + Redis fully decouples ingestion from log processing |
-| ✅ PII redaction | Regex + Luhn validation; runs in worker; `pii_detections` stored per log |
-| ✅ Docker Compose one-command | `docker compose up --build` starts all 6 services |
-| ✅ Cancel a conversation | `asyncio.Event` registry; cancel button stops LLM stream mid-response |
-| ✅ List conversations | Sidebar with all active conversations, sorted by last activity |
-| ✅ Resume a conversation | Full message history loaded; multi-turn context preserved |
-| ✅ Local model support | Ollama integration; auto-discovers pulled models via `/api/tags` |
-| ✅ Markdown rendering | `marked.js` renders LLM responses with proper formatting |
+
+| Feature                                   | How                                                                      |
+| ----------------------------------------- | ------------------------------------------------------------------------ |
+| ✅ Multi-provider support                  | OpenAI, Anthropic, Google Gemini, Ollama — switchable per chat message   |
+| ✅ Streaming responses                     | SSE end-to-end: LLM → FastAPI → Browser, with TTFT measurement           |
+| ✅ Live dashboard                          | Redis Pub/Sub → SSE → Chart.js charts auto-update as logs arrive         |
+| ✅ Latency / Throughput / Error dashboards | p50/p95/p99 latency, requests over time, error breakdown by type         |
+| ✅ Event-based architecture                | Celery + Redis fully decouples ingestion from log processing             |
+| ✅ PII redaction                           | Regex + Luhn validation; runs in worker; `pii_detections` stored per log |
+| ✅ Docker Compose one-command              | `docker compose up --build` starts all 6 services                        |
+| ✅ Cancel a conversation                   | `asyncio.Event` registry; cancel button stops LLM stream mid-response    |
+| ✅ List conversations                      | Sidebar with all active conversations, sorted by last activity           |
+| ✅ Resume a conversation                   | Full message history loaded; multi-turn context preserved                |
+| ✅ Local model support                     | Ollama integration; auto-discovers pulled models via `/api/tags`         |
+| ✅ Markdown rendering                      | `marked.js` renders LLM responses with proper formatting                 |
+
+

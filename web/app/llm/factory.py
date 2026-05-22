@@ -280,6 +280,7 @@ async def _ollama_stream(model, messages, obs_client, conv_id, cancel_event):
     ttft_ms = None
     output_chunks = []
 
+    usage = None
     try:
         stream = await client.chat.completions.create(
             model=model,
@@ -290,7 +291,7 @@ async def _ollama_stream(model, messages, obs_client, conv_id, cancel_event):
             if cancel_event and cancel_event.is_set():
                 await stream.close()
                 _send_log(obs_client, span_id, "ollama", model, conv_id, messages,
-                          output_chunks, None, "cancelled", started, started_iso, ttft_ms, True)
+                          output_chunks, usage, "cancelled", started, started_iso, ttft_ms, True)
                 return
 
             if chunk.choices:
@@ -302,12 +303,19 @@ async def _ollama_stream(model, messages, obs_client, conv_id, cancel_event):
                     output_chunks.append(delta.content)
                     yield delta.content
 
+            # Ollama returns usage in the final chunk (no stream_options needed)
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage = {
+                    "prompt_tokens": chunk.usage.prompt_tokens,
+                    "completion_tokens": chunk.usage.completion_tokens,
+                }
+
         _send_log(obs_client, span_id, "ollama", model, conv_id, messages,
-                  output_chunks, None, "success", started, started_iso, ttft_ms, True)
+                  output_chunks, usage, "success", started, started_iso, ttft_ms, True)
 
     except Exception as exc:
         _send_log(obs_client, span_id, "ollama", model, conv_id, messages,
-                  output_chunks, None, "error", started, started_iso, ttft_ms, True,
+                  output_chunks, usage, "error", started, started_iso, ttft_ms, True,
                   error={"type": type(exc).__name__, "message": str(exc)[:500]})
         raise
 
