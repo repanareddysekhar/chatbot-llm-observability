@@ -10,25 +10,20 @@ from sse_starlette.sse import EventSourceResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..config import settings
 from ..database import get_db
-from ..models import Conversation, ConversationStatus, Message, MessageRole, Provider
-
-try:
-    from llm_obs import stream_chat
-except ImportError:
-    async def stream_chat(*_, **__):  # type: ignore
-        yield "SDK not installed"
+from ..messages import build_llm_messages, new_assistant_message, new_user_message
+from ..models import Conversation, ConversationStatus, Message, Provider
 from .. import cancel_registry
 
 try:
-    from llm_obs import set_obs_context
+    from llm_obs import stream_chat, set_obs_context
     from llm_obs.id import new_id
 except ImportError:
+    async def stream_chat(*_, **__):  # type: ignore
+        yield "SDK not installed"
     def set_obs_context(**_): pass  # type: ignore
     import uuid as _uuid
     def new_id(): return str(_uuid.uuid4())  # type: ignore
-
 
 router = APIRouter(prefix="/api")
 
@@ -45,7 +40,6 @@ async def chat(body: ChatRequest, db: AsyncSession = Depends(get_db)):
     """SSE streaming chat endpoint."""
 
     async def generate():
-        # Load or create conversation
         conv_id = body.conversation_id
         if conv_id:
             result = await db.execute(
@@ -66,7 +60,6 @@ async def chat(body: ChatRequest, db: AsyncSession = Depends(get_db)):
             db.add(conv)
             await db.flush()
 
-        # Load history
         msgs_result = await db.execute(
             select(Message)
             .where(Message.conversation_id == conv.id)
@@ -74,26 +67,11 @@ async def chat(body: ChatRequest, db: AsyncSession = Depends(get_db)):
         )
         history = msgs_result.scalars().all()
 
-        llm_messages = [{"role": "system", "content": "You are a helpful assistant."}]
-        for m in history[-20:]:
-            llm_messages.append({"role": m.role.value.lower(), "content": m.content})
-        llm_messages.append({"role": "user", "content": body.message})
-
-        # Persist user message
-        user_msg = Message(
-            id=uuid.uuid4(),
-            conversation_id=conv.id,
-            role=MessageRole.USER,
-            content=body.message,
-        )
-        db.add(user_msg)
+        db.add(new_user_message(conv.id, body.message))
         await db.flush()
 
         inference_log_id = new_id()
         cancel_event = cancel_registry.register(inference_log_id)
-
-        # Tell the SDK which conversation this belongs to —
-        # providers pick this up via contextvars, no parameter threading needed
         set_obs_context(conversation_id=str(conv.id))
 
         yield {
@@ -109,7 +87,7 @@ async def chat(body: ChatRequest, db: AsyncSession = Depends(get_db)):
             async for chunk in stream_chat(
                 provider=body.provider,
                 model=body.model,
-                messages=llm_messages,
+                messages=build_llm_messages(history, body.message),
                 cancel_event=cancel_event,
             ):
                 full_response.append(chunk)
@@ -126,14 +104,7 @@ async def chat(body: ChatRequest, db: AsyncSession = Depends(get_db)):
 
         assistant_content = "".join(full_response)
         if assistant_content:
-            asst_msg = Message(
-                id=uuid.uuid4(),
-                conversation_id=conv.id,
-                role=MessageRole.ASSISTANT,
-                content=assistant_content,
-                inference_log_id=uuid.UUID(inference_log_id) if len(inference_log_id) == 36 else None,
-            )
-            db.add(asst_msg)
+            db.add(new_assistant_message(conv.id, assistant_content, inference_log_id))
 
         conv.updated_at = datetime.now(timezone.utc)
         await db.commit()

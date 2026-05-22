@@ -66,7 +66,6 @@ class Message(Base):
         Enum(MessageRole, name="messagerole", create_type=False), nullable=False
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    content_redacted: Mapped[str | None] = mapped_column(Text, nullable=True)
     tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     inference_log_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
