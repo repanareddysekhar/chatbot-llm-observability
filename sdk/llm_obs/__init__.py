@@ -1,5 +1,5 @@
 from .client import ObservabilityClient
-from .pii import redact as redact_text
+from .guard import redact_text
 from .context import set_obs_context, get_conversation_id, get_session_id, clear_obs_context
 from .streaming import stream_chat, available_providers
 from .discovery import discover_from_env, detect_provider, DiscoveredProvider

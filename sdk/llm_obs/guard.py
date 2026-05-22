@@ -33,12 +33,22 @@ def sanitize_messages_for_llm(messages: list[dict]) -> list[dict]:
     return redacted
 
 
-def sanitize_text_for_llm(text: str) -> str:
-    """Redact PII from a plain string before it is sent to an LLM provider."""
+def redact_text(text: str) -> str:
+    """Redact PII from a plain string. Respects ObservabilityClient.redact_pii."""
+    if not text:
+        return text
     from .client import get_active_client
     obs = get_active_client()
-    if not _enabled(obs) or not text:
+    if obs is not None and not obs.redact_pii:
         return text
-    from .pii import redact
-    redacted, _ = redact(text)
-    return redacted
+    try:
+        from .pii import redact
+        redacted, _ = redact(text)
+        return redacted
+    except ImportError:
+        return text
+
+
+def sanitize_text_for_llm(text: str) -> str:
+    """Redact PII from a plain string before it is sent to an LLM provider."""
+    return redact_text(text)

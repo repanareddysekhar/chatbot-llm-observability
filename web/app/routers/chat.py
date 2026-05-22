@@ -29,18 +29,6 @@ except ImportError:
     import uuid as _uuid
     def new_id(): return str(_uuid.uuid4())  # type: ignore
 
-try:
-    from llm_obs import redact_text as _redact_text_fn
-except ImportError:
-    _redact_text_fn = None
-
-
-def _redact_text(text: str) -> str:
-    if not _redact_text_fn or not text:
-        return text
-    redacted, _ = _redact_text_fn(text)
-    return redacted
-
 
 router = APIRouter(prefix="/api")
 
@@ -97,7 +85,6 @@ async def chat(body: ChatRequest, db: AsyncSession = Depends(get_db)):
             conversation_id=conv.id,
             role=MessageRole.USER,
             content=body.message,
-            content_redacted=_redact_text(body.message),
         )
         db.add(user_msg)
         await db.flush()
@@ -144,7 +131,6 @@ async def chat(body: ChatRequest, db: AsyncSession = Depends(get_db)):
                 conversation_id=conv.id,
                 role=MessageRole.ASSISTANT,
                 content=assistant_content,
-                content_redacted=_redact_text(assistant_content),
                 inference_log_id=uuid.UUID(inference_log_id) if len(inference_log_id) == 36 else None,
             )
             db.add(asst_msg)

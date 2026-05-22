@@ -150,10 +150,10 @@ class ObservabilityClient:
 
     def redact_text(self, text: str) -> str:
         """Redact PII from a plain string. Respects the redact_pii setting."""
-        from .guard import sanitize_text_for_llm
         if not self.redact_pii or not text:
             return text
-        return sanitize_text_for_llm(text)
+        from .guard import redact_text as _redact_text
+        return _redact_text(text)
 
     def flush(self) -> None:
         self._transport.flush()
