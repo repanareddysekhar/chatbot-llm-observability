@@ -32,4 +32,4 @@ install:
 
 publish-sdk:
 	cd sdk && python -m build
-	cd sdk && twine upload dist/llm_obs-$${VERSION:-0.1.2}*
+	cd sdk && twine upload dist/llm_obs-$${VERSION:-0.1.3}*

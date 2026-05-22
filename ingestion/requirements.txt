@@ -10,4 +10,4 @@ redis==5.2.1
 sse-starlette==2.1.3
 httpx==0.28.1
 python-dotenv==1.0.1
-llm-obs==0.1.2
+llm-obs==0.1.3
