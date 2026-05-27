@@ -4,6 +4,17 @@ Lightweight Python SDK for LLM inference logging and observability.
 
 Auto-instruments OpenAI, Anthropic, Google Gemini, AWS Bedrock, Ollama, and any OpenAI-compatible endpoint — zero changes to your LLM call code.
 
+**Vendor-neutral:** send logs to any HTTP ingestion API that accepts the SDK payload (including self-hosted stacks). The [Repana LLM observability](https://github.com/repanareddysekhar/llm-observability) platform is one compatible backend, not a requirement.
+
+---
+
+## Related projects
+
+| Project | What it is |
+| --- | --- |
+| **This repo (`llm-obs`)** | Open-source Python SDK (MIT) |
+| **[llm-observability](https://github.com/repanareddysekhar/llm-observability)** | Full stack: ingestion API, worker, dashboard (may stay private or partially open) |
+
 ---
 
 ## Install
